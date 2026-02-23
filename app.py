@@ -1,52 +1,48 @@
 import streamlit as st
 import pandas as pd
+import os
 
 # --- PHASE 2: DATA SETUP ---
 @st.cache_data
+@st.cache_data
 def load_data():
-    # Load your downloaded FanGraphs projections (THE BAT X for batters, ATC for pitchers)
     batters = pd.read_csv("the_bat_x_batters.csv") 
     pitchers = pd.read_csv("atc_pitchers.csv")
     
-    # --- NEW: Calculate Total Bases (TB) ---
-    # TB = Hits + Doubles + (2 * Triples) + (3 * Home Runs)
-    batters['TB'] = batters['H'] + batters['2B'] + (2 * batters['3B']) + (3 * batters['HR'])
-
-    # 1. Apply Custom Batter Scoring
-    # R=1, TB=1, RBI=1, BB=1, K=-1, SB=1
+    # Calculate Total Bases (TB)
+    if all(col in batters.columns for col in ['H', '2B', '3B', 'HR']):
+        batters['TB'] = batters['H'] + batters['2B'] + (2 * batters['3B']) + (3 * batters['HR'])
+    
+    # Apply Custom Batter Scoring
     batters['Total_Points'] = (
-        batters['R'] * 1 +
-        batters['TB'] * 1 +
-        batters['RBI'] * 1 +
-        batters['BB'] * 1 +
-        batters['SO'] * -1 +  # SO is strikeouts
-        batters['SB'] * 1
+        batters['R'] * 1 + batters.get('TB', 0) * 1 + batters['RBI'] * 1 +
+        batters['BB'] * 1 + batters['SO'] * -1 + batters['SB'] * 1
     )
     
-    # 2. Apply Custom Pitcher Scoring
-    # IP=3, H=-1, ER=-2, BB=-1, K=1, QS=1, W=2, L=-2, SV=5, HD=2
+    # Apply Custom Pitcher Scoring
     pitchers['Total_Points'] = (
-        pitchers['IP'] * 3 +
-        pitchers['H'] * -1 +
-        pitchers['ER'] * -2 +
-        pitchers['BB'] * -1 +
-        pitchers['SO'] * 1 + 
-        pitchers['QS'] * 1 +
-        pitchers['W'] * 2 +
-        pitchers['L'] * -2 +
-        pitchers['SV'] * 5 +
-        pitchers['HLD'] * 2
+        pitchers['IP'] * 3 + pitchers['H'] * -1 + pitchers['ER'] * -2 +
+        pitchers['BB'] * -1 + pitchers['SO'] * 1 + pitchers.get('QS', 0) * 1 +
+        pitchers['W'] * 2 + pitchers['L'] * -2 + pitchers.get('SV', 0) * 5 + pitchers.get('HLD', 0) * 2
     )
 
-    # 3. Calculate Weekly Averages
-    # 24 total weeks (20 regular season + 4 playoff weeks)
+    # Calculate Weekly Averages (24 weeks)
     batters['Weekly_Avg'] = batters['Total_Points'] / 24
     pitchers['Weekly_Avg'] = pitchers['Total_Points'] / 24
     
-    # Add a Draft Status column
     batters['Drafted_By'] = "Available"
     pitchers['Drafted_By'] = "Available"
     
+    # --- NEW: STATE PERSISTENCE LOGIC ---
+    # If a save file exists, read it and re-apply the drafted statuses
+    if os.path.exists("draft_state.csv"):
+        state_df = pd.read_csv("draft_state.csv")
+        for index, row in state_df.iterrows():
+            if row['Type'] == 'Batter':
+                batters.loc[batters['Name'] == row['Name'], 'Drafted_By'] = row['Team']
+            else:
+                pitchers.loc[pitchers['Name'] == row['Name'], 'Drafted_By'] = row['Team']
+                
     return batters, pitchers
 
 # --- PHASE 3: BUILDING THE UI ---
@@ -70,12 +66,31 @@ else:
 
 selected_player = st.sidebar.selectbox("Player", available_players)
 
+# The Draft Button
 if st.sidebar.button("Draft Player"):
+    # 1. Update the live session state
     if player_type == "Batter":
         st.session_state.batters.loc[st.session_state.batters['Name'] == selected_player, 'Drafted_By'] = selected_team
     else:
         st.session_state.pitchers.loc[st.session_state.pitchers['Name'] == selected_player, 'Drafted_By'] = selected_team
+        
+    # 2. Write to the persistent save file
+    new_draft_record = pd.DataFrame({'Name': [selected_player], 'Type': [player_type], 'Team': [selected_team]})
+    if os.path.exists("draft_state.csv"):
+        new_draft_record.to_csv("draft_state.csv", mode='a', header=False, index=False)
+    else:
+        new_draft_record.to_csv("draft_state.csv", mode='w', header=True, index=False)
+        
     st.sidebar.success(f"{selected_player} drafted by {selected_team}")
+
+st.sidebar.markdown("---")
+st.sidebar.header("Data Controls")
+
+# The Refresh Button
+if st.sidebar.button("Refresh Projections & Cache"):
+    st.cache_data.clear()
+    st.session_state.batters, st.session_state.pitchers = load_data()
+    st.sidebar.success("Projections reloaded from CSV and draft state restored!")
 
 # --- MAIN DASHBOARD ---
 tab1, tab2 = st.tabs(["Available Players", "Team Rosters"])

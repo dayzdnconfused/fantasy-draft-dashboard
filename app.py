@@ -93,7 +93,7 @@ if st.sidebar.button("Refresh Projections & Cache"):
     st.sidebar.success("Projections reloaded from CSV and draft state restored!")
 
 # --- MAIN DASHBOARD ---
-tab1, tab2 = st.tabs(["Available Players", "Team Rosters"])
+tab1, tab2, tab3 = st.tabs(["Available Players", "Team Rosters", "League Standings"])
 
 with tab1:
     st.header("Available Projections")
@@ -150,3 +150,45 @@ with tab2:
     
     st.subheader("Pitchers")
     st.dataframe(team_pitchers[['Name', 'Total_Points', 'Weekly_Avg']], hide_index=True)
+
+with tab3:
+    st.header("Live League Standings")
+    
+    # 1. Filter out the available players, leaving only the drafted ones
+    drafted_batters = st.session_state.batters[st.session_state.batters['Drafted_By'] != "Available"]
+    drafted_pitchers = st.session_state.pitchers[st.session_state.pitchers['Drafted_By'] != "Available"]
+    
+    if drafted_batters.empty and drafted_pitchers.empty:
+        st.info("No players have been drafted yet. Standings will appear here once the draft begins.")
+    else:
+        # 2. Group batters and pitchers by Team and sum their points
+        b_standings = pd.DataFrame()
+        if not drafted_batters.empty:
+            b_standings = drafted_batters.groupby('Drafted_By')[['Total_Points', 'Weekly_Avg']].sum().reset_index()
+            
+        p_standings = pd.DataFrame()
+        if not drafted_pitchers.empty:
+            p_standings = drafted_pitchers.groupby('Drafted_By')[['Total_Points', 'Weekly_Avg']].sum().reset_index()
+            
+        # 3. Combine both groups and do one final sum to get total team points
+        combined = pd.concat([b_standings, p_standings])
+        league_standings = combined.groupby('Drafted_By')[['Total_Points', 'Weekly_Avg']].sum().reset_index()
+        
+        # 4. Clean up the table for display
+        league_standings = league_standings.rename(columns={
+            'Drafted_By': 'Team', 
+            'Total_Points': 'Proj Total Points', 
+            'Weekly_Avg': 'Proj Weekly Avg'
+        })
+        league_standings = league_standings.sort_values(by='Proj Total Points', ascending=False)
+        
+        # 5. Render the leaderboard
+        st.dataframe(
+            league_standings,
+            column_config={
+                "Proj Total Points": st.column_config.NumberColumn(format="%.2f"),
+                "Proj Weekly Avg": st.column_config.NumberColumn(format="%.2f")
+            },
+            hide_index=True,
+            use_container_width=True # Stretches the table to look like a proper leaderboard
+        )

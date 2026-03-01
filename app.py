@@ -3,10 +3,11 @@ import pandas as pd
 import os
 import sqlite3
 import requests
+import plotly.express as px
+import plotly.graph_objects as go
 
 # --- PHASE 0: DATABASE INITIALIZATION ---
 def init_db():
-    """Initializes a robust SQLite database for transactional state management."""
     conn = sqlite3.connect('draft_room.db')
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS draft_picks
@@ -48,16 +49,13 @@ def calculate_baselines(batters, pitchers, pools):
 
 # --- PHASE 2: DATA SETUP & ETL LOGIC ---
 def fetch_fangraphs_projections():
-    """Hits the FanGraphs JSON API directly to download and update local CSVs."""
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     try:
-        # Fetch THE BAT X Batters
         bat_url = "https://www.fangraphs.com/api/projections?type=thebatx&stats=bat&pos=all&team=0&players=0&lg=all"
         bat_resp = requests.get(bat_url, headers=headers)
         if bat_resp.status_code == 200:
             pd.DataFrame(bat_resp.json()).to_csv("the_bat_x_batters.csv", index=False)
             
-        # Fetch ATC Pitchers
         pit_url = "https://www.fangraphs.com/api/projections?type=atc&stats=pit&pos=all&team=0&players=0&lg=all"
         pit_resp = requests.get(pit_url, headers=headers)
         if pit_resp.status_code == 200:
@@ -79,7 +77,6 @@ def load_data():
     batters = pd.read_csv("the_bat_x_batters.csv") 
     pitchers = pd.read_csv("atc_pitchers.csv")
     
-    # Normalizing FanGraphs API JSON headers to match traditional CSV formats
     if 'PlayerName' in batters.columns:
         batters = batters.rename(columns={'PlayerName': 'Name', 'playerids': 'PlayerId'})
     if 'PlayerName' in pitchers.columns:
@@ -97,7 +94,6 @@ def load_data():
     if all(col in batters.columns for col in ['H', '2B', '3B', 'HR']):
         batters['TB'] = batters['H'] + batters['2B'] + (2 * batters['3B']) + (3 * batters['HR'])
     
-    # Dynamic column mapping to handle 'SO' vs 'K' API naming differences
     k_col_b = 'K' if 'K' in batters.columns else 'SO'
     k_col_p = 'K' if 'K' in pitchers.columns else 'SO'
     
@@ -120,7 +116,6 @@ def load_data():
     batters['Drafted_Pos'] = None
     pitchers['Drafted_Pos'] = None
     
-    # SQLite Integration for Safe Draft Loading
     conn = sqlite3.connect('draft_room.db')
     state_df = pd.read_sql_query("SELECT * FROM draft_picks", conn)
     conn.close()
@@ -150,7 +145,11 @@ if 'teams' not in st.session_state:
 if 'batters' not in st.session_state:
     st.session_state.batters, st.session_state.pitchers = load_data()
 
-# --- SNAKE DRAFT CALCULATOR (Now Database-Backed) ---
+# Global Data Variables for cross-tab calculations
+drafted_batters = st.session_state.batters[st.session_state.batters['Drafted_By'] != "Available"]
+drafted_pitchers = st.session_state.pitchers[st.session_state.pitchers['Drafted_By'] != "Available"]
+
+# --- SNAKE DRAFT CALCULATOR ---
 conn = sqlite3.connect('draft_room.db')
 c = conn.cursor()
 c.execute("SELECT COUNT(*) FROM draft_picks")
@@ -169,6 +168,8 @@ else:
 # --- SIDEBAR: DRAFT CONTROLS ---
 st.sidebar.header(f"Draft Room - Pick {total_drafted + 1}")
 st.sidebar.markdown(f"**Round {current_round} | On the Clock:**")
+
+player_type = st.sidebar.radio("Player Type", ["Batter", "Pitcher"], horizontal=True, key="player_type_radio")
 
 selected_team = st.sidebar.selectbox("Selecting Team", st.session_state.teams, index=team_on_clock_idx)
 player_type = st.sidebar.radio("Player Type", ["Batter", "Pitcher"], horizontal=True)
@@ -206,7 +207,6 @@ if st.sidebar.button("Draft Player", type="primary"):
             st.session_state.pitchers.loc[st.session_state.pitchers['Name'] == selected_player, 'Drafted_Pos'] = selected_pos
         record_type, record_pos = player_type, selected_pos
         
-    # Instant, safe SQL transaction
     conn = sqlite3.connect('draft_room.db')
     c = conn.cursor()
     c.execute("INSERT INTO draft_picks VALUES (?, ?, ?, ?)", (selected_player, record_type, selected_team, record_pos))
@@ -214,16 +214,16 @@ if st.sidebar.button("Draft Player", type="primary"):
     conn.close()
         
     st.sidebar.success(f"{selected_player} drafted to {selected_team} as {record_pos}")
+    st.session_state.main_view_radio = "Pitchers" if player_type == "Pitcher" else "Batters"
     st.rerun() 
 
 st.sidebar.markdown("---")
 
-# --- NEW: DRAFT MANAGEMENT (UNDO / RESET) ---
+# --- DRAFT MANAGEMENT ---
 with st.sidebar.expander("Draft Management (Undo/Reset)"):
     if st.button("Undo Last Pick"):
         conn = sqlite3.connect('draft_room.db')
         c = conn.cursor()
-        # SQLite's internal rowid reliably gives us the very last inserted record
         c.execute("SELECT rowid, Name FROM draft_picks ORDER BY rowid DESC LIMIT 1")
         last_pick = c.fetchone()
         
@@ -231,14 +231,11 @@ with st.sidebar.expander("Draft Management (Undo/Reset)"):
             row_id, player_name = last_pick
             c.execute("DELETE FROM draft_picks WHERE rowid = ?", (row_id,))
             conn.commit()
-            
-            # Clear the cache and session state so the board perfectly rebuilds itself
             st.cache_data.clear()
             st.session_state.batters, st.session_state.pitchers = load_data()
             st.success(f"Successfully undid pick: {player_name}")
         else:
             st.warning("No picks to undo.")
-            
         conn.close()
         st.rerun()
 
@@ -250,7 +247,6 @@ with st.sidebar.expander("Draft Management (Undo/Reset)"):
         c.execute("DELETE FROM draft_picks")
         conn.commit()
         conn.close()
-        
         st.cache_data.clear()
         st.session_state.batters, st.session_state.pitchers = load_data()
         st.success("Draft completely reset!")
@@ -276,7 +272,6 @@ with st.sidebar.expander("Customize Team Names"):
         st.success("Teams saved!")
         st.rerun()
 
-# --- THE DYNAMIC BASELINE TOGGLE ---
 baseline_mode = st.sidebar.radio("RPV Baseline Calculation", ["Static (Pre-Draft)", "Dynamic (Available Only)"])
 
 with st.sidebar.expander("Adjust Positional Pools"):
@@ -294,7 +289,6 @@ current_pools = {
     'SS': ss_pool, 'OF': of_pool, 'SP': sp_pool, 'RP': rp_pool
 }
 
-# Baseline Generation Engine Logic
 if baseline_mode == "Dynamic (Available Only)":
     avail_batters = st.session_state.batters[st.session_state.batters['Drafted_By'] == 'Available']
     avail_pitchers = st.session_state.pitchers[st.session_state.pitchers['Drafted_By'] == 'Available']
@@ -318,13 +312,15 @@ with st.sidebar.expander("ETL & Data Sync"):
         st.session_state.batters, st.session_state.pitchers = load_data()
         st.success("Cache Cleared!")
 
-
 # --- MAIN DASHBOARD ---
 tab1, tab2, tab3, tab4 = st.tabs(["Available Players", "Team Rosters", "League Standings", "Draft Board"])
 
 with tab1:
     st.header("Available Projections")
-    view_type = st.radio("View", ["Batters", "Pitchers"], horizontal=True)
+    if "main_view_radio" not in st.session_state:
+        st.session_state.main_view_radio = "Batters"
+        
+    view_type = st.radio("View", ["Batters", "Pitchers"], horizontal=True, key="main_view_radio")
     
     if view_type == "Batters":
         df = st.session_state.batters[st.session_state.batters['Drafted_By'] == "Available"].copy()
@@ -341,15 +337,29 @@ with tab1:
             df['VOA'] = df['Total_Points'] - active_baseline
             df['RPV'] = (df['VOA'] / active_baseline) * 100 
             
-            # Standardize K vs SO depending on the API payload
+            # --- VIS 1: TRUE VALUE SCATTER PLOT ---
+            with st.expander("📊 View True Value Scatter Plot (Top 150)", expanded=False):
+                scatter_df = df.sort_values('VOA', ascending=False).head(150)
+                fig_scatter = px.scatter(scatter_df, x="Total_Points", y="RPV", color="Pos", hover_name="Name", 
+                                         title=f"Total Points vs. RPV% (Available {pos_filter} Batters)",
+                                         labels={"Total_Points": "Total Projected Points", "RPV": "RPV (%)"})
+                fig_scatter.update_layout(height=400)
+                st.plotly_chart(fig_scatter, use_container_width=True)
+            
+            # --- VIS 2: SCARCITY CLIFF ---
+            with st.expander(f"📉 View Positional Scarcity Cliff ({pos_filter})", expanded=True):
+                top_10 = df.sort_values('VOA', ascending=False).head(10)
+                fig_cliff = px.line(top_10, x="Name", y="VOA", markers=True, 
+                                    title=f"Top 10 Remaining {pos_filter} - VOA Drop-off",
+                                    labels={"Name": "Player", "VOA": "Value Over Average"})
+                fig_cliff.update_traces(line_color='#00b4d8', marker=dict(size=10, color='#0077b6'))
+                st.plotly_chart(fig_cliff, use_container_width=True)
+            
             k_col = 'K' if 'K' in df.columns else 'SO'
             display_cols = ['Name', 'Team', 'Pos', 'VOA', 'RPV', 'R', 'TB', 'RBI', 'BB', k_col, 'SB', 'Total_Points', 'Weekly_Avg']
-            
-            st.dataframe(
-                df[display_cols].sort_values(by="VOA", ascending=False),
-                column_config={"VOA": st.column_config.NumberColumn("VOA (+/-)", format="%.1f"), "RPV": st.column_config.NumberColumn("RPV", format="%.1f%%")},
-                hide_index=True
-            )
+            st.dataframe(df[display_cols].sort_values(by="VOA", ascending=False),
+                         column_config={"VOA": st.column_config.NumberColumn("VOA (+/-)", format="%.1f"), "RPV": st.column_config.NumberColumn("RPV", format="%.1f%%")},
+                         hide_index=True)
     else:
         df = st.session_state.pitchers[st.session_state.pitchers['Drafted_By'] == "Available"].copy()
         if 'Pos' in df.columns:
@@ -365,18 +375,33 @@ with tab1:
             df['VOA'] = df['Total_Points'] - active_baseline
             df['RPV'] = (df['VOA'] / active_baseline) * 100
             
+            # --- VIS 1: TRUE VALUE SCATTER PLOT ---
+            with st.expander("📊 View True Value Scatter Plot (Top 100)", expanded=False):
+                scatter_df = df.sort_values('VOA', ascending=False).head(100)
+                fig_scatter = px.scatter(scatter_df, x="Total_Points", y="RPV", color="Pos", hover_name="Name", 
+                                         title=f"Total Points vs. RPV% (Available {pos_filter} Pitchers)",
+                                         labels={"Total_Points": "Total Projected Points", "RPV": "RPV (%)"})
+                fig_scatter.update_layout(height=400)
+                st.plotly_chart(fig_scatter, use_container_width=True)
+            
+            # --- VIS 2: SCARCITY CLIFF ---
+            with st.expander(f"📉 View Positional Scarcity Cliff ({pos_filter})", expanded=True):
+                top_10 = df.sort_values('VOA', ascending=False).head(10)
+                fig_cliff = px.line(top_10, x="Name", y="VOA", markers=True, 
+                                    title=f"Top 10 Remaining {pos_filter} - VOA Drop-off",
+                                    labels={"Name": "Player", "VOA": "Value Over Average"})
+                fig_cliff.update_traces(line_color='#ff9f1c', marker=dict(size=10, color='#e07a5f'))
+                st.plotly_chart(fig_cliff, use_container_width=True)
+
             k_col = 'K' if 'K' in df.columns else 'SO'
             display_cols = ['Name', 'Team', 'Pos', 'VOA', 'RPV', 'IP', 'H', 'ER', 'BB', k_col, 'QS', 'W', 'L', 'SV', 'HLD', 'Total_Points', 'Weekly_Avg']
             display_cols = [col for col in display_cols if col in df.columns]
-            
-            st.dataframe(
-                df[display_cols].sort_values(by="VOA", ascending=False),
-                column_config={"VOA": st.column_config.NumberColumn("VOA (+/-)", format="%.1f"), "RPV": st.column_config.NumberColumn("RPV", format="%.1f%%")},
-                hide_index=True
-            )
+            st.dataframe(df[display_cols].sort_values(by="VOA", ascending=False),
+                         column_config={"VOA": st.column_config.NumberColumn("VOA (+/-)", format="%.1f"), "RPV": st.column_config.NumberColumn("RPV", format="%.1f%%")},
+                         hide_index=True)
 
 with tab2:
-    st.header("Team Summaries")
+    st.header("Team Summaries & Analysis")
     team_view = st.selectbox("Select Team to View", st.session_state.teams)
     
     team_batters = st.session_state.batters[st.session_state.batters['Drafted_By'] == team_view]
@@ -389,6 +414,37 @@ with tab2:
     col1.metric("Projected Total Points", f"{total_proj_points:.2f}")
     col2.metric("Projected Weekly Average", f"{total_weekly_avg:.2f}")
     
+    # --- VIS 3: HITTING VS PITCHING BALANCE GAUGE ---
+    st.markdown("---")
+    st.subheader("Roster Balance Analysis")
+    
+    # Calculate League Totals
+    league_bat_pts = drafted_batters['Total_Points'].sum() if not drafted_batters.empty else 0
+    league_pit_pts = drafted_pitchers['Total_Points'].sum() if not drafted_pitchers.empty else 0
+    league_total = league_bat_pts + league_pit_pts
+    
+    # Calculate Selected Team Totals
+    team_bat_pts = team_batters['Total_Points'].sum()
+    team_pit_pts = team_pitchers['Total_Points'].sum()
+    
+    col_chart1, col_chart2 = st.columns(2)
+    with col_chart1:
+        if total_proj_points > 0:
+            fig_team = go.Figure(data=[go.Pie(labels=['Hitting', 'Pitching'], values=[team_bat_pts, team_pit_pts], hole=.4, marker_colors=['#4361ee', '#f72585'])])
+            fig_team.update_layout(title_text=f"{team_view} Point Split", title_x=0.5)
+            st.plotly_chart(fig_team, use_container_width=True)
+        else:
+            st.info(f"Draft players to {team_view} to see balance.")
+            
+    with col_chart2:
+        if league_total > 0:
+            fig_lg = go.Figure(data=[go.Pie(labels=['Hitting', 'Pitching'], values=[league_bat_pts, league_pit_pts], hole=.4, marker_colors=['#4361ee', '#f72585'])])
+            fig_lg.update_layout(title_text="League Average Point Split", title_x=0.5)
+            st.plotly_chart(fig_lg, use_container_width=True)
+        else:
+            st.info("Draft players to see the league average balance.")
+    st.markdown("---")
+
     st.subheader("Hitters")
     hitter_display = ['Name', 'Drafted_Pos', 'Total_Points', 'Weekly_Avg'] if 'Drafted_Pos' in team_batters.columns else ['Name', 'Total_Points', 'Weekly_Avg']
     st.dataframe(team_batters[hitter_display], hide_index=True)
@@ -399,12 +455,26 @@ with tab2:
 
 with tab3:
     st.header("Live League Standings")
-    drafted_batters = st.session_state.batters[st.session_state.batters['Drafted_By'] != "Available"]
-    drafted_pitchers = st.session_state.pitchers[st.session_state.pitchers['Drafted_By'] != "Available"]
     
     if drafted_batters.empty and drafted_pitchers.empty:
         st.info("No players have been drafted yet.")
     else:
+        # --- VIS 4: LEAGUE-WIDE POINT ALLOCATION (THE ROSTER X-RAY) ---
+        st.subheader("Roster Construction X-Ray")
+        dbat = drafted_batters[['Drafted_By', 'Drafted_Pos', 'Total_Points']].copy()
+        dpit = drafted_pitchers[['Drafted_By', 'Drafted_Pos', 'Total_Points']].copy()
+        alloc_df = pd.concat([dbat, dpit])
+        
+        # Group by Team and Drafted_Pos for the stacked bar
+        alloc_grouped = alloc_df.groupby(['Drafted_By', 'Drafted_Pos'])['Total_Points'].sum().reset_index()
+        
+        fig_alloc = px.bar(alloc_grouped, y='Drafted_By', x='Total_Points', color='Drafted_Pos', 
+                           orientation='h', title="Projected Points by Position per Team",
+                           labels={'Drafted_By': 'Team', 'Total_Points': 'Total Projected Points'})
+        fig_alloc.update_layout(barmode='stack', yaxis={'categoryorder':'total ascending'}, height=500)
+        st.plotly_chart(fig_alloc, use_container_width=True)
+        st.markdown("---")
+
         b_standings = pd.DataFrame()
         if not drafted_batters.empty:
             b_standings = drafted_batters.groupby('Drafted_By')[['Total_Points', 'Weekly_Avg']].sum().reset_index()
@@ -424,7 +494,6 @@ with tab3:
 
 with tab4:
     st.header("Draft Board")
-    # Fetch completely cleanly from the SQLite DB
     conn = sqlite3.connect('draft_room.db')
     draft_df = pd.read_sql_query("SELECT * FROM draft_picks", conn)
     conn.close()

@@ -1,6 +1,22 @@
 import streamlit as st
 import pandas as pd
 import os
+import sqlite3
+import requests
+
+# --- PHASE 0: DATABASE INITIALIZATION ---
+def init_db():
+    """Initializes a robust SQLite database for transactional state management."""
+    conn = sqlite3.connect('draft_room.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS draft_picks
+                 (Name TEXT, Type TEXT, Team TEXT, Position TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS teams
+                 (TeamName TEXT)''')
+    conn.commit()
+    conn.close()
+
+init_db()
 
 # --- PHASE 1: BASELINE ENGINE ---
 def calculate_baselines(batters, pitchers, pools):
@@ -30,28 +46,49 @@ def calculate_baselines(batters, pitchers, pools):
             
     return baselines
 
-# --- PHASE 2: DATA SETUP & TEAM LOGIC ---
+# --- PHASE 2: DATA SETUP & ETL LOGIC ---
+def fetch_fangraphs_projections():
+    """Hits the FanGraphs JSON API directly to download and update local CSVs."""
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    try:
+        # Fetch THE BAT X Batters
+        bat_url = "https://www.fangraphs.com/api/projections?type=thebatx&stats=bat&pos=all&team=0&players=0&lg=all"
+        bat_resp = requests.get(bat_url, headers=headers)
+        if bat_resp.status_code == 200:
+            pd.DataFrame(bat_resp.json()).to_csv("the_bat_x_batters.csv", index=False)
+            
+        # Fetch ATC Pitchers
+        pit_url = "https://www.fangraphs.com/api/projections?type=atc&stats=pit&pos=all&team=0&players=0&lg=all"
+        pit_resp = requests.get(pit_url, headers=headers)
+        if pit_resp.status_code == 200:
+            pd.DataFrame(pit_resp.json()).to_csv("atc_pitchers.csv", index=False)
+        return True
+    except Exception as e:
+        return False
+
 def load_teams():
-    """Loads custom team names or generates defaults."""
-    if os.path.exists("teams.csv"):
-        return pd.read_csv("teams.csv")['Team'].tolist()
-    return [f"Team {i}" for i in range(1, 11)]
+    conn = sqlite3.connect('draft_room.db')
+    teams = pd.read_sql_query("SELECT TeamName FROM teams", conn)['TeamName'].tolist()
+    conn.close()
+    if not teams:
+        return [f"Team {i}" for i in range(1, 11)]
+    return teams
 
 @st.cache_data
 def load_data():
     batters = pd.read_csv("the_bat_x_batters.csv") 
     pitchers = pd.read_csv("atc_pitchers.csv")
-    id_map = pd.read_csv("id_map.csv")
     
-    # --- PHASE 2: DATA SETUP & TEAM LOGIC ---
-
+    # Normalizing FanGraphs API JSON headers to match traditional CSV formats
+    if 'PlayerName' in batters.columns:
+        batters = batters.rename(columns={'PlayerName': 'Name', 'playerids': 'PlayerId'})
+    if 'PlayerName' in pitchers.columns:
+        pitchers = pitchers.rename(columns={'PlayerName': 'Name', 'playerids': 'PlayerId'})
+        
     id_map = pd.read_csv("id_map.csv")
-    
     id_map = id_map.rename(columns={'IDFANGRAPHS': 'PlayerId', 'ALLPOS': 'Pos'})
     id_map['Pos'] = id_map['Pos'].str.upper()
     id_map['Pos'] = id_map['Pos'].str.replace(r'\bP\b', 'SP', regex=True)
-    
-    # --- BUG 1 FIX: Drop duplicate IDs so players like Shohei don't multiply ---
     id_map_clean = id_map[['PlayerId', 'Pos']].drop_duplicates(subset=['PlayerId'])
     
     batters = pd.merge(batters, id_map_clean, on='PlayerId', how='left')
@@ -60,14 +97,18 @@ def load_data():
     if all(col in batters.columns for col in ['H', '2B', '3B', 'HR']):
         batters['TB'] = batters['H'] + batters['2B'] + (2 * batters['3B']) + (3 * batters['HR'])
     
+    # Dynamic column mapping to handle 'SO' vs 'K' API naming differences
+    k_col_b = 'K' if 'K' in batters.columns else 'SO'
+    k_col_p = 'K' if 'K' in pitchers.columns else 'SO'
+    
     batters['Total_Points'] = (
         batters['R'] * 1 + batters.get('TB', 0) * 1 + batters['RBI'] * 1 +
-        batters['BB'] * 1 + batters['SO'] * -1 + batters['SB'] * 1
+        batters['BB'] * 1 + batters[k_col_b] * -1 + batters['SB'] * 1
     )
     
     pitchers['Total_Points'] = (
         pitchers['IP'] * 3 + pitchers['H'] * -1 + pitchers['ER'] * -2 +
-        pitchers['BB'] * -1 + pitchers['SO'] * 1 + pitchers.get('QS', 0) * 1 +
+        pitchers['BB'] * -1 + pitchers[k_col_p] * 1 + pitchers.get('QS', 0) * 1 +
         pitchers['W'] * 2 + pitchers['L'] * -2 + pitchers.get('SV', 0) * 5 + pitchers.get('HLD', 0) * 2
     )
 
@@ -79,19 +120,23 @@ def load_data():
     batters['Drafted_Pos'] = None
     pitchers['Drafted_Pos'] = None
     
-    if os.path.exists("draft_state.csv"):
-        state_df = pd.read_csv("draft_state.csv")
-        # Safety check for old save files that don't have the Position column yet
-        if 'Position' not in state_df.columns:
-            state_df['Position'] = 'UTIL' 
+    # SQLite Integration for Safe Draft Loading
+    conn = sqlite3.connect('draft_room.db')
+    state_df = pd.read_sql_query("SELECT * FROM draft_picks", conn)
+    conn.close()
             
-        for index, row in state_df.iterrows():
-            if row['Type'] == 'Batter':
-                batters.loc[batters['Name'] == row['Name'], 'Drafted_By'] = row['Team']
-                batters.loc[batters['Name'] == row['Name'], 'Drafted_Pos'] = row['Position']
-            else:
-                pitchers.loc[pitchers['Name'] == row['Name'], 'Drafted_By'] = row['Team']
-                pitchers.loc[pitchers['Name'] == row['Name'], 'Drafted_Pos'] = row['Position']
+    for index, row in state_df.iterrows():
+        if row['Type'] == 'Two-Way' or row['Name'] == 'Shohei Ohtani':
+            batters.loc[batters['Name'] == row['Name'], 'Drafted_By'] = row['Team']
+            batters.loc[batters['Name'] == row['Name'], 'Drafted_Pos'] = 'UTIL'
+            pitchers.loc[pitchers['Name'] == row['Name'], 'Drafted_By'] = row['Team']
+            pitchers.loc[pitchers['Name'] == row['Name'], 'Drafted_Pos'] = 'SP'
+        elif row['Type'] == 'Batter':
+            batters.loc[batters['Name'] == row['Name'], 'Drafted_By'] = row['Team']
+            batters.loc[batters['Name'] == row['Name'], 'Drafted_Pos'] = row['Position']
+        else:
+            pitchers.loc[pitchers['Name'] == row['Name'], 'Drafted_By'] = row['Team']
+            pitchers.loc[pitchers['Name'] == row['Name'], 'Drafted_Pos'] = row['Position']
                 
     return batters, pitchers
 
@@ -105,17 +150,17 @@ if 'teams' not in st.session_state:
 if 'batters' not in st.session_state:
     st.session_state.batters, st.session_state.pitchers = load_data()
 
-# --- SNAKE DRAFT CALCULATOR ---
-# Calculate exactly where we are in the draft to auto-assign the next team
-total_drafted = 0
-if os.path.exists("draft_state.csv"):
-    total_drafted = len(pd.read_csv("draft_state.csv"))
+# --- SNAKE DRAFT CALCULATOR (Now Database-Backed) ---
+conn = sqlite3.connect('draft_room.db')
+c = conn.cursor()
+c.execute("SELECT COUNT(*) FROM draft_picks")
+total_drafted = c.fetchone()[0]
+conn.close()
 
 num_teams = len(st.session_state.teams)
 current_round = (total_drafted // num_teams) + 1
 pick_in_round = total_drafted % num_teams
 
-# Odd rounds go 0-9, Even rounds go 9-0 (Snake Logic)
 if current_round % 2 != 0:
     team_on_clock_idx = pick_in_round
 else:
@@ -125,9 +170,7 @@ else:
 st.sidebar.header(f"Draft Room - Pick {total_drafted + 1}")
 st.sidebar.markdown(f"**Round {current_round} | On the Clock:**")
 
-# We use the calculated index to default the dropdown to the correct team
 selected_team = st.sidebar.selectbox("Selecting Team", st.session_state.teams, index=team_on_clock_idx)
-
 player_type = st.sidebar.radio("Player Type", ["Batter", "Pitcher"], horizontal=True)
 
 if player_type == "Batter":
@@ -137,7 +180,6 @@ else:
 
 selected_player = st.sidebar.selectbox("Player", available_players)
 
-# Dynamically parse the player's position column to create a dropdown for how they will be slotted
 if selected_player:
     if player_type == "Batter":
         raw_pos = st.session_state.batters.loc[st.session_state.batters['Name'] == selected_player, 'Pos'].values[0]
@@ -149,71 +191,72 @@ if selected_player:
     selected_pos = st.sidebar.selectbox("Draft As (Position)", pos_options)
 
 if st.sidebar.button("Draft Player", type="primary"):
-    # --- THE OHTANI EXCEPTION (DRAFT) ---
     if selected_player == "Shohei Ohtani":
-        # Draft him in both dataframes simultaneously
         st.session_state.batters.loc[st.session_state.batters['Name'] == selected_player, 'Drafted_By'] = selected_team
         st.session_state.batters.loc[st.session_state.batters['Name'] == selected_player, 'Drafted_Pos'] = "UTIL"
         st.session_state.pitchers.loc[st.session_state.pitchers['Name'] == selected_player, 'Drafted_By'] = selected_team
         st.session_state.pitchers.loc[st.session_state.pitchers['Name'] == selected_player, 'Drafted_Pos'] = "SP"
-        
-        # Override the save variables so he takes up 1 row, but is marked as Two-Way
-        record_type = "Two-Way"
-        record_pos = "UTIL/SP"
+        record_type, record_pos = "Two-Way", "UTIL/SP"
     else:
-        # Standard Draft Logic
         if player_type == "Batter":
             st.session_state.batters.loc[st.session_state.batters['Name'] == selected_player, 'Drafted_By'] = selected_team
             st.session_state.batters.loc[st.session_state.batters['Name'] == selected_player, 'Drafted_Pos'] = selected_pos
         else:
             st.session_state.pitchers.loc[st.session_state.pitchers['Name'] == selected_player, 'Drafted_By'] = selected_team
             st.session_state.pitchers.loc[st.session_state.pitchers['Name'] == selected_player, 'Drafted_Pos'] = selected_pos
-            
-        record_type = player_type
-        record_pos = selected_pos
+        record_type, record_pos = player_type, selected_pos
         
-    # Safely reconstruct the CSV
-    new_record = pd.DataFrame({'Name': [selected_player], 'Type': [record_type], 'Team': [selected_team], 'Position': [record_pos]})
-    
-    if os.path.exists("draft_state.csv"):
-        try:
-            draft_df = pd.read_csv("draft_state.csv")
-            draft_df = pd.concat([draft_df, new_record], ignore_index=True)
-            draft_df.to_csv("draft_state.csv", index=False)
-        except Exception:
-            new_record.to_csv("draft_state.csv", index=False)
-    else:
-        new_record.to_csv("draft_state.csv", index=False)
+    # Instant, safe SQL transaction
+    conn = sqlite3.connect('draft_room.db')
+    c = conn.cursor()
+    c.execute("INSERT INTO draft_picks VALUES (?, ?, ?, ?)", (selected_player, record_type, selected_team, record_pos))
+    conn.commit()
+    conn.close()
         
     st.sidebar.success(f"{selected_player} drafted to {selected_team} as {record_pos}")
-    st.rerun()
-        
-    # --- BUG 2 FIX: Safely reconstruct the CSV to prevent column shifting ---
-    new_record = pd.DataFrame({'Name': [selected_player], 'Type': [player_type], 'Team': [selected_team], 'Position': [selected_pos]})
-    
-    if os.path.exists("draft_state.csv"):
-        state_df = pd.read_csv("draft_state.csv")
-        if 'Position' not in state_df.columns:
-            state_df['Position'] = 'UTIL' 
-            
-        for index, row in state_df.iterrows():
-            # --- THE OHTANI EXCEPTION (LOAD) ---
-            if row['Type'] == 'Two-Way' or row['Name'] == 'Shohei Ohtani':
-                batters.loc[batters['Name'] == row['Name'], 'Drafted_By'] = row['Team']
-                batters.loc[batters['Name'] == row['Name'], 'Drafted_Pos'] = 'UTIL'
-                pitchers.loc[pitchers['Name'] == row['Name'], 'Drafted_By'] = row['Team']
-                pitchers.loc[pitchers['Name'] == row['Name'], 'Drafted_Pos'] = 'SP'
-            elif row['Type'] == 'Batter':
-                batters.loc[batters['Name'] == row['Name'], 'Drafted_By'] = row['Team']
-                batters.loc[batters['Name'] == row['Name'], 'Drafted_Pos'] = row['Position']
-            else:
-                pitchers.loc[pitchers['Name'] == row['Name'], 'Drafted_By'] = row['Team']
-                pitchers.loc[pitchers['Name'] == row['Name'], 'Drafted_Pos'] = row['Position']
-        
-    st.sidebar.success(f"{selected_player} drafted to {selected_team} as {selected_pos}")
-    st.rerun() # Instantly refreshes the board and advances the snake draft counter
+    st.rerun() 
 
 st.sidebar.markdown("---")
+
+# --- NEW: DRAFT MANAGEMENT (UNDO / RESET) ---
+with st.sidebar.expander("Draft Management (Undo/Reset)"):
+    if st.button("Undo Last Pick"):
+        conn = sqlite3.connect('draft_room.db')
+        c = conn.cursor()
+        # SQLite's internal rowid reliably gives us the very last inserted record
+        c.execute("SELECT rowid, Name FROM draft_picks ORDER BY rowid DESC LIMIT 1")
+        last_pick = c.fetchone()
+        
+        if last_pick:
+            row_id, player_name = last_pick
+            c.execute("DELETE FROM draft_picks WHERE rowid = ?", (row_id,))
+            conn.commit()
+            
+            # Clear the cache and session state so the board perfectly rebuilds itself
+            st.cache_data.clear()
+            st.session_state.batters, st.session_state.pitchers = load_data()
+            st.success(f"Successfully undid pick: {player_name}")
+        else:
+            st.warning("No picks to undo.")
+            
+        conn.close()
+        st.rerun()
+
+    st.markdown("---")
+    
+    if st.button("🧨 Reset Entire Draft"):
+        conn = sqlite3.connect('draft_room.db')
+        c = conn.cursor()
+        c.execute("DELETE FROM draft_picks")
+        conn.commit()
+        conn.close()
+        
+        st.cache_data.clear()
+        st.session_state.batters, st.session_state.pitchers = load_data()
+        st.success("Draft completely reset!")
+        st.rerun()
+
+# --- LEAGUE SETTINGS ---
 st.sidebar.header("League Settings")
 with st.sidebar.expander("Customize Team Names"):
     st.warning("Only edit before the draft begins!")
@@ -222,10 +265,19 @@ with st.sidebar.expander("Customize Team Names"):
         new_teams.append(st.text_input(f"Team {i+1}", value=default_name))
         
     if st.button("Save Team Names"):
-        pd.DataFrame({'Team': new_teams}).to_csv("teams.csv", index=False)
+        conn = sqlite3.connect('draft_room.db')
+        c = conn.cursor()
+        c.execute("DELETE FROM teams")
+        for t in new_teams:
+            c.execute("INSERT INTO teams VALUES (?)", (t,))
+        conn.commit()
+        conn.close()
         st.session_state.teams = new_teams
         st.success("Teams saved!")
         st.rerun()
+
+# --- THE DYNAMIC BASELINE TOGGLE ---
+baseline_mode = st.sidebar.radio("RPV Baseline Calculation", ["Static (Pre-Draft)", "Dynamic (Available Only)"])
 
 with st.sidebar.expander("Adjust Positional Pools"):
     c_pool = st.number_input("Catcher (C)", value=10, step=1)
@@ -242,12 +294,30 @@ current_pools = {
     'SS': ss_pool, 'OF': of_pool, 'SP': sp_pool, 'RP': rp_pool
 }
 
-if st.sidebar.button("Refresh Projections & Cache"):
-    st.cache_data.clear()
-    st.session_state.batters, st.session_state.pitchers = load_data()
-    st.sidebar.success("Projections reloaded!")
+# Baseline Generation Engine Logic
+if baseline_mode == "Dynamic (Available Only)":
+    avail_batters = st.session_state.batters[st.session_state.batters['Drafted_By'] == 'Available']
+    avail_pitchers = st.session_state.pitchers[st.session_state.pitchers['Drafted_By'] == 'Available']
+    baselines = calculate_baselines(avail_batters, avail_pitchers, current_pools)
+else:
+    baselines = calculate_baselines(st.session_state.batters, st.session_state.pitchers, current_pools)
 
-baselines = calculate_baselines(st.session_state.batters, st.session_state.pitchers, current_pools)
+with st.sidebar.expander("ETL & Data Sync"):
+    if st.button("Download Latest Projections"):
+        with st.spinner("Fetching from FanGraphs API..."):
+            success = fetch_fangraphs_projections()
+            if success:
+                st.cache_data.clear()
+                st.session_state.batters, st.session_state.pitchers = load_data()
+                st.success("Projections Synced & Reloaded!")
+            else:
+                st.error("Failed to fetch data. Check your connection.")
+    
+    if st.button("Refresh Code Cache"):
+        st.cache_data.clear()
+        st.session_state.batters, st.session_state.pitchers = load_data()
+        st.success("Cache Cleared!")
+
 
 # --- MAIN DASHBOARD ---
 tab1, tab2, tab3, tab4 = st.tabs(["Available Players", "Team Rosters", "League Standings", "Draft Board"])
@@ -270,7 +340,11 @@ with tab1:
             active_baseline = baselines.get('UTIL', 0.001) if pos_filter == "All" else baselines.get(pos_filter, 0.001)
             df['VOA'] = df['Total_Points'] - active_baseline
             df['RPV'] = (df['VOA'] / active_baseline) * 100 
-            display_cols = ['Name', 'Team', 'Pos', 'VOA', 'RPV', 'R', 'TB', 'RBI', 'BB', 'SO', 'SB', 'Total_Points', 'Weekly_Avg']
+            
+            # Standardize K vs SO depending on the API payload
+            k_col = 'K' if 'K' in df.columns else 'SO'
+            display_cols = ['Name', 'Team', 'Pos', 'VOA', 'RPV', 'R', 'TB', 'RBI', 'BB', k_col, 'SB', 'Total_Points', 'Weekly_Avg']
+            
             st.dataframe(
                 df[display_cols].sort_values(by="VOA", ascending=False),
                 column_config={"VOA": st.column_config.NumberColumn("VOA (+/-)", format="%.1f"), "RPV": st.column_config.NumberColumn("RPV", format="%.1f%%")},
@@ -290,8 +364,11 @@ with tab1:
             active_baseline = baselines.get('SP', 0.001) if pos_filter == "All" else baselines.get(pos_filter, 0.001)
             df['VOA'] = df['Total_Points'] - active_baseline
             df['RPV'] = (df['VOA'] / active_baseline) * 100
-            display_cols = ['Name', 'Team', 'Pos', 'VOA', 'RPV', 'IP', 'H', 'ER', 'BB', 'SO', 'QS', 'W', 'L', 'SV', 'HLD', 'Total_Points', 'Weekly_Avg']
+            
+            k_col = 'K' if 'K' in df.columns else 'SO'
+            display_cols = ['Name', 'Team', 'Pos', 'VOA', 'RPV', 'IP', 'H', 'ER', 'BB', k_col, 'QS', 'W', 'L', 'SV', 'HLD', 'Total_Points', 'Weekly_Avg']
             display_cols = [col for col in display_cols if col in df.columns]
+            
             st.dataframe(
                 df[display_cols].sort_values(by="VOA", ascending=False),
                 column_config={"VOA": st.column_config.NumberColumn("VOA (+/-)", format="%.1f"), "RPV": st.column_config.NumberColumn("RPV", format="%.1f%%")},
@@ -347,22 +424,22 @@ with tab3:
 
 with tab4:
     st.header("Draft Board")
-    if os.path.exists("draft_state.csv"):
-        draft_df = pd.read_csv("draft_state.csv")
-        if 'Position' not in draft_df.columns:
-            draft_df['Position'] = 'UTIL'
-            
+    # Fetch completely cleanly from the SQLite DB
+    conn = sqlite3.connect('draft_room.db')
+    draft_df = pd.read_sql_query("SELECT * FROM draft_picks", conn)
+    conn.close()
+    
+    if not draft_df.empty:
         board = pd.DataFrame(index=range(1, 22), columns=st.session_state.teams)
         
         for team in st.session_state.teams:
             team_picks = draft_df[draft_df['Team'] == team]
             for i, (_, row) in enumerate(team_picks.iterrows()):
-                # Format: Player Name (POS)
                 board.at[i+1, team] = f"{row['Name']} ({row['Position']})"
         
         def color_board(val):
             if pd.isna(val) or val == "": return ''
-            if 'UTIL/SP' in val: return 'background-color: #ffd700; color: black;' # Gold for Ohtani
+            if 'UTIL/SP' in val: return 'background-color: #ffd700; color: black;' 
             elif '(C)' in val: return 'background-color: #ffb3ba; color: black;'
             elif '(1B)' in val: return 'background-color: #ffdfba; color: black;'
             elif '(2B)' in val: return 'background-color: #ffffba; color: black;'

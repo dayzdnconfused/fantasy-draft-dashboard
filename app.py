@@ -74,18 +74,16 @@ def load_teams():
 
 @st.cache_data
 def load_data():
-    
-    # --- NEW: Cloud Deployment Failsafe ---
-    # If the CSVs are missing (like on a fresh cloud server), download them automatically
-    if not os.path.exists("the_bat_x_batters.csv") or not os.path.exists("atc_pitchers.csv"):
-        success = fetch_fangraphs_projections()
-        if not success:
-            st.error("Failed to fetch initial projections from FanGraphs. The API might be down.")
-            st.stop() # Halts the app so it doesn't crash ugly
-
+    # If the files are entirely missing, we can't run the app.
+    # This prevents the ugly traceback and gives a helpful error message instead.
+    if not os.path.exists("the_bat_x_batters.csv") or not os.path.exists("atc_pitchers.csv") or not os.path.exists("id_map.csv"):
+        st.error("Data files missing! Please ensure the_bat_x_batters.csv, atc_pitchers.csv, and id_map.csv are pushed to your GitHub repository.")
+        st.stop()
+            
     batters = pd.read_csv("the_bat_x_batters.csv") 
     pitchers = pd.read_csv("atc_pitchers.csv")
     
+    # Normalizing FanGraphs API JSON headers to match traditional CSV formats
     if 'PlayerName' in batters.columns:
         batters = batters.rename(columns={'PlayerName': 'Name', 'playerids': 'PlayerId'})
     if 'PlayerName' in pitchers.columns:

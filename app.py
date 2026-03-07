@@ -96,8 +96,11 @@ def fetch_official_injury_status():
             df = pd.DataFrame(injury_list)
             if not df.empty:
                 return df.drop_duplicates(subset=['Name'])
-    except Exception:
-        pass
+    except Exception as e:
+        # NEW: We are no longer using 'pass' to silently swallow the error.
+        # This will blast the exact network or parsing error to the UI.
+        st.error(f"MLB API Error: {e}") 
+        
     return pd.DataFrame(columns=['Name', 'Injury_Status'])
 
 def load_teams():

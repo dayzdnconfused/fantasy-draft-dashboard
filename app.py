@@ -1,17 +1,26 @@
 import streamlit as st
 import pandas as pd
 import os
-import sqlite3
+import psycopg2
 import requests
 import plotly.express as px
 import plotly.graph_objects as go
+import warnings
+
+# Suppress pandas warning about using raw psycopg2 connections
+warnings.filterwarnings('ignore', category=UserWarning)
+
+def get_db_connection():
+    """Establishes a connection to the PostgreSQL database using Streamlit Secrets."""
+    return psycopg2.connect(st.secrets["DATABASE_URL"])
 
 # --- PHASE 0: DATABASE INITIALIZATION ---
 def init_db():
-    conn = sqlite3.connect('draft_room.db')
+    conn = get_db_connection()
     c = conn.cursor()
+    # Postgres uses SERIAL PRIMARY KEY to auto-increment IDs for safe undo functionality
     c.execute('''CREATE TABLE IF NOT EXISTS draft_picks
-                 (Name TEXT, Type TEXT, Team TEXT, Position TEXT)''')
+                 (id SERIAL PRIMARY KEY, Name TEXT, Type TEXT, Team TEXT, Position TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS teams
                  (TeamName TEXT)''')
     conn.commit()
@@ -64,9 +73,36 @@ def fetch_fangraphs_projections():
     except Exception as e:
         return False
 
+@st.cache_data(ttl=3600)
+def fetch_official_injury_status():
+    try:
+        url = "https://statsapi.mlb.com/api/v1/teams?sportId=1&hydrate=roster(rosterType=fullRoster)"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            injury_list = []
+            for team in data.get("teams", []):
+                roster_data = team.get("roster", {}).get("roster", [])
+                for player in roster_data:
+                    status_dict = player.get("status", {})
+                    status_code = status_dict.get("code", "")
+                    status_desc = status_dict.get("description", "")
+                    
+                    if status_code.startswith('D') or status_code == 'O' or 'IL' in status_desc:
+                        name = player.get("person", {}).get("fullName", "")
+                        injury_list.append({"Name": name, "Injury_Status": status_desc})
+                        
+            df = pd.DataFrame(injury_list)
+            if not df.empty:
+                return df.drop_duplicates(subset=['Name'])
+    except Exception:
+        pass
+    return pd.DataFrame(columns=['Name', 'Injury_Status'])
+
 def load_teams():
-    conn = sqlite3.connect('draft_room.db')
-    teams = pd.read_sql_query("SELECT TeamName FROM teams", conn)['TeamName'].tolist()
+    conn = get_db_connection()
+    teams = pd.read_sql_query("SELECT TeamName FROM teams", conn)['teamname'].tolist() # Postgres returns lowercase columns automatically
     conn.close()
     if not teams:
         return [f"Team {i}" for i in range(1, 11)]
@@ -74,8 +110,6 @@ def load_teams():
 
 @st.cache_data
 def load_data():
-    # If the files are entirely missing, we can't run the app.
-    # This prevents the ugly traceback and gives a helpful error message instead.
     if not os.path.exists("the_bat_x_batters.csv") or not os.path.exists("atc_pitchers.csv") or not os.path.exists("id_map.csv"):
         st.error("Data files missing! Please ensure the_bat_x_batters.csv, atc_pitchers.csv, and id_map.csv are pushed to your GitHub repository.")
         st.stop()
@@ -83,7 +117,6 @@ def load_data():
     batters = pd.read_csv("the_bat_x_batters.csv") 
     pitchers = pd.read_csv("atc_pitchers.csv")
     
-    # Normalizing FanGraphs API JSON headers to match traditional CSV formats
     if 'PlayerName' in batters.columns:
         batters = batters.rename(columns={'PlayerName': 'Name', 'playerids': 'PlayerId'})
     if 'PlayerName' in pitchers.columns:
@@ -97,6 +130,16 @@ def load_data():
     
     batters = pd.merge(batters, id_map_clean, on='PlayerId', how='left')
     pitchers = pd.merge(pitchers, id_map_clean, on='PlayerId', how='left')
+
+    injury_df = fetch_official_injury_status()
+    if not injury_df.empty:
+        batters = pd.merge(batters, injury_df, on='Name', how='left')
+        pitchers = pd.merge(pitchers, injury_df, on='Name', how='left')
+        batters['Injury_Status'] = batters['Injury_Status'].fillna("")
+        pitchers['Injury_Status'] = pitchers['Injury_Status'].fillna("")
+    else:
+        batters['Injury_Status'] = ""
+        pitchers['Injury_Status'] = ""
 
     if all(col in batters.columns for col in ['H', '2B', '3B', 'HR']):
         batters['TB'] = batters['H'] + batters['2B'] + (2 * batters['3B']) + (3 * batters['HR'])
@@ -123,22 +166,28 @@ def load_data():
     batters['Drafted_Pos'] = None
     pitchers['Drafted_Pos'] = None
     
-    conn = sqlite3.connect('draft_room.db')
+    conn = get_db_connection()
     state_df = pd.read_sql_query("SELECT * FROM draft_picks", conn)
     conn.close()
             
     for index, row in state_df.iterrows():
-        if row['Type'] == 'Two-Way' or row['Name'] == 'Shohei Ohtani':
-            batters.loc[batters['Name'] == row['Name'], 'Drafted_By'] = row['Team']
-            batters.loc[batters['Name'] == row['Name'], 'Drafted_Pos'] = 'UTIL'
-            pitchers.loc[pitchers['Name'] == row['Name'], 'Drafted_By'] = row['Team']
-            pitchers.loc[pitchers['Name'] == row['Name'], 'Drafted_Pos'] = 'SP'
-        elif row['Type'] == 'Batter':
-            batters.loc[batters['Name'] == row['Name'], 'Drafted_By'] = row['Team']
-            batters.loc[batters['Name'] == row['Name'], 'Drafted_Pos'] = row['Position']
+        # Using Postgres lowercase column names from pandas output
+        name = row['name']
+        team = row['team']
+        pos = row['position']
+        row_type = row['type']
+        
+        if row_type == 'Two-Way' or name == 'Shohei Ohtani':
+            batters.loc[batters['Name'] == name, 'Drafted_By'] = team
+            batters.loc[batters['Name'] == name, 'Drafted_Pos'] = 'UTIL'
+            pitchers.loc[pitchers['Name'] == name, 'Drafted_By'] = team
+            pitchers.loc[pitchers['Name'] == name, 'Drafted_Pos'] = 'SP'
+        elif row_type == 'Batter':
+            batters.loc[batters['Name'] == name, 'Drafted_By'] = team
+            batters.loc[batters['Name'] == name, 'Drafted_Pos'] = pos
         else:
-            pitchers.loc[pitchers['Name'] == row['Name'], 'Drafted_By'] = row['Team']
-            pitchers.loc[pitchers['Name'] == row['Name'], 'Drafted_Pos'] = row['Position']
+            pitchers.loc[pitchers['Name'] == name, 'Drafted_By'] = team
+            pitchers.loc[pitchers['Name'] == name, 'Drafted_Pos'] = pos
                 
     return batters, pitchers
 
@@ -152,12 +201,11 @@ if 'teams' not in st.session_state:
 if 'batters' not in st.session_state:
     st.session_state.batters, st.session_state.pitchers = load_data()
 
-# Global Data Variables for cross-tab calculations
 drafted_batters = st.session_state.batters[st.session_state.batters['Drafted_By'] != "Available"]
 drafted_pitchers = st.session_state.pitchers[st.session_state.pitchers['Drafted_By'] != "Available"]
 
 # --- SNAKE DRAFT CALCULATOR ---
-conn = sqlite3.connect('draft_room.db')
+conn = get_db_connection()
 c = conn.cursor()
 c.execute("SELECT COUNT(*) FROM draft_picks")
 total_drafted = c.fetchone()[0]
@@ -176,10 +224,11 @@ else:
 st.sidebar.header(f"Draft Room - Pick {total_drafted + 1}")
 st.sidebar.markdown(f"**Round {current_round} | On the Clock:**")
 
-player_type = st.sidebar.radio("Player Type", ["Batter", "Pitcher"], horizontal=True, key="player_type_radio")
-
 selected_team = st.sidebar.selectbox("Selecting Team", st.session_state.teams, index=team_on_clock_idx)
-player_type = st.sidebar.radio("Player Type", ["Batter", "Pitcher"], horizontal=True)
+
+if "player_type_radio" not in st.session_state:
+    st.session_state.player_type_radio = "Batter"
+player_type = st.sidebar.radio("Player Type", ["Batter", "Pitcher"], horizontal=True, key="player_type_radio")
 
 if player_type == "Batter":
     available_players = st.session_state.batters[st.session_state.batters['Drafted_By'] == "Available"]['Name'].tolist()
@@ -214,9 +263,11 @@ if st.sidebar.button("Draft Player", type="primary"):
             st.session_state.pitchers.loc[st.session_state.pitchers['Name'] == selected_player, 'Drafted_Pos'] = selected_pos
         record_type, record_pos = player_type, selected_pos
         
-    conn = sqlite3.connect('draft_room.db')
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("INSERT INTO draft_picks VALUES (?, ?, ?, ?)", (selected_player, record_type, selected_team, record_pos))
+    # Postgres uses %s instead of ? for parameter insertion
+    c.execute("INSERT INTO draft_picks (Name, Type, Team, Position) VALUES (%s, %s, %s, %s)", 
+              (selected_player, record_type, selected_team, record_pos))
     conn.commit()
     conn.close()
         
@@ -229,14 +280,14 @@ st.sidebar.markdown("---")
 # --- DRAFT MANAGEMENT ---
 with st.sidebar.expander("Draft Management (Undo/Reset)"):
     if st.button("Undo Last Pick"):
-        conn = sqlite3.connect('draft_room.db')
+        conn = get_db_connection()
         c = conn.cursor()
-        c.execute("SELECT rowid, Name FROM draft_picks ORDER BY rowid DESC LIMIT 1")
+        c.execute("SELECT id, Name FROM draft_picks ORDER BY id DESC LIMIT 1")
         last_pick = c.fetchone()
         
         if last_pick:
             row_id, player_name = last_pick
-            c.execute("DELETE FROM draft_picks WHERE rowid = ?", (row_id,))
+            c.execute("DELETE FROM draft_picks WHERE id = %s", (row_id,))
             conn.commit()
             st.cache_data.clear()
             st.session_state.batters, st.session_state.pitchers = load_data()
@@ -249,7 +300,7 @@ with st.sidebar.expander("Draft Management (Undo/Reset)"):
     st.markdown("---")
     
     if st.button("🧨 Reset Entire Draft"):
-        conn = sqlite3.connect('draft_room.db')
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute("DELETE FROM draft_picks")
         conn.commit()
@@ -268,11 +319,11 @@ with st.sidebar.expander("Customize Team Names"):
         new_teams.append(st.text_input(f"Team {i+1}", value=default_name))
         
     if st.button("Save Team Names"):
-        conn = sqlite3.connect('draft_room.db')
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute("DELETE FROM teams")
         for t in new_teams:
-            c.execute("INSERT INTO teams VALUES (?)", (t,))
+            c.execute("INSERT INTO teams (TeamName) VALUES (%s)", (t,))
         conn.commit()
         conn.close()
         st.session_state.teams = new_teams
@@ -344,7 +395,6 @@ with tab1:
             df['VOA'] = df['Total_Points'] - active_baseline
             df['RPV'] = (df['VOA'] / active_baseline) * 100 
             
-            # --- VIS 1: TRUE VALUE SCATTER PLOT ---
             with st.expander("📊 View True Value Scatter Plot (Top 150)", expanded=False):
                 scatter_df = df.sort_values('VOA', ascending=False).head(150)
                 fig_scatter = px.scatter(scatter_df, x="Total_Points", y="RPV", color="Pos", hover_name="Name", 
@@ -353,7 +403,6 @@ with tab1:
                 fig_scatter.update_layout(height=400)
                 st.plotly_chart(fig_scatter, use_container_width=True)
             
-            # --- VIS 2: SCARCITY CLIFF ---
             with st.expander(f"📉 View Positional Scarcity Cliff ({pos_filter})", expanded=True):
                 top_10 = df.sort_values('VOA', ascending=False).head(10)
                 fig_cliff = px.line(top_10, x="Name", y="VOA", markers=True, 
@@ -363,7 +412,7 @@ with tab1:
                 st.plotly_chart(fig_cliff, use_container_width=True)
             
             k_col = 'K' if 'K' in df.columns else 'SO'
-            display_cols = ['Name', 'Team', 'Pos', 'VOA', 'RPV', 'R', 'TB', 'RBI', 'BB', k_col, 'SB', 'Total_Points', 'Weekly_Avg']
+            display_cols = ['Name', 'Injury_Status', 'Team', 'Pos', 'VOA', 'RPV', 'R', 'TB', 'RBI', 'BB', k_col, 'SB', 'Total_Points', 'Weekly_Avg']
             st.dataframe(df[display_cols].sort_values(by="VOA", ascending=False),
                          column_config={"VOA": st.column_config.NumberColumn("VOA (+/-)", format="%.1f"), "RPV": st.column_config.NumberColumn("RPV", format="%.1f%%")},
                          hide_index=True)
@@ -382,7 +431,6 @@ with tab1:
             df['VOA'] = df['Total_Points'] - active_baseline
             df['RPV'] = (df['VOA'] / active_baseline) * 100
             
-            # --- VIS 1: TRUE VALUE SCATTER PLOT ---
             with st.expander("📊 View True Value Scatter Plot (Top 100)", expanded=False):
                 scatter_df = df.sort_values('VOA', ascending=False).head(100)
                 fig_scatter = px.scatter(scatter_df, x="Total_Points", y="RPV", color="Pos", hover_name="Name", 
@@ -391,7 +439,6 @@ with tab1:
                 fig_scatter.update_layout(height=400)
                 st.plotly_chart(fig_scatter, use_container_width=True)
             
-            # --- VIS 2: SCARCITY CLIFF ---
             with st.expander(f"📉 View Positional Scarcity Cliff ({pos_filter})", expanded=True):
                 top_10 = df.sort_values('VOA', ascending=False).head(10)
                 fig_cliff = px.line(top_10, x="Name", y="VOA", markers=True, 
@@ -401,7 +448,7 @@ with tab1:
                 st.plotly_chart(fig_cliff, use_container_width=True)
 
             k_col = 'K' if 'K' in df.columns else 'SO'
-            display_cols = ['Name', 'Team', 'Pos', 'VOA', 'RPV', 'IP', 'H', 'ER', 'BB', k_col, 'QS', 'W', 'L', 'SV', 'HLD', 'Total_Points', 'Weekly_Avg']
+            display_cols = ['Name', 'Injury_Status', 'Team', 'Pos', 'VOA', 'RPV', 'IP', 'H', 'ER', 'BB', k_col, 'QS', 'W', 'L', 'SV', 'HLD', 'Total_Points', 'Weekly_Avg']
             display_cols = [col for col in display_cols if col in df.columns]
             st.dataframe(df[display_cols].sort_values(by="VOA", ascending=False),
                          column_config={"VOA": st.column_config.NumberColumn("VOA (+/-)", format="%.1f"), "RPV": st.column_config.NumberColumn("RPV", format="%.1f%%")},
@@ -421,16 +468,13 @@ with tab2:
     col1.metric("Projected Total Points", f"{total_proj_points:.2f}")
     col2.metric("Projected Weekly Average", f"{total_weekly_avg:.2f}")
     
-    # --- VIS 3: HITTING VS PITCHING BALANCE GAUGE ---
     st.markdown("---")
     st.subheader("Roster Balance Analysis")
     
-    # Calculate League Totals
     league_bat_pts = drafted_batters['Total_Points'].sum() if not drafted_batters.empty else 0
     league_pit_pts = drafted_pitchers['Total_Points'].sum() if not drafted_pitchers.empty else 0
     league_total = league_bat_pts + league_pit_pts
     
-    # Calculate Selected Team Totals
     team_bat_pts = team_batters['Total_Points'].sum()
     team_pit_pts = team_pitchers['Total_Points'].sum()
     
@@ -466,13 +510,11 @@ with tab3:
     if drafted_batters.empty and drafted_pitchers.empty:
         st.info("No players have been drafted yet.")
     else:
-        # --- VIS 4: LEAGUE-WIDE POINT ALLOCATION (THE ROSTER X-RAY) ---
         st.subheader("Roster Construction X-Ray")
         dbat = drafted_batters[['Drafted_By', 'Drafted_Pos', 'Total_Points']].copy()
         dpit = drafted_pitchers[['Drafted_By', 'Drafted_Pos', 'Total_Points']].copy()
         alloc_df = pd.concat([dbat, dpit])
         
-        # Group by Team and Drafted_Pos for the stacked bar
         alloc_grouped = alloc_df.groupby(['Drafted_By', 'Drafted_Pos'])['Total_Points'].sum().reset_index()
         
         fig_alloc = px.bar(alloc_grouped, y='Drafted_By', x='Total_Points', color='Drafted_Pos', 
@@ -501,7 +543,7 @@ with tab3:
 
 with tab4:
     st.header("Draft Board")
-    conn = sqlite3.connect('draft_room.db')
+    conn = get_db_connection()
     draft_df = pd.read_sql_query("SELECT * FROM draft_picks", conn)
     conn.close()
     
@@ -509,9 +551,10 @@ with tab4:
         board = pd.DataFrame(index=range(1, 22), columns=st.session_state.teams)
         
         for team in st.session_state.teams:
-            team_picks = draft_df[draft_df['Team'] == team]
+            # Using Postgres lowercase column names mapped out of Pandas
+            team_picks = draft_df[draft_df['team'] == team]
             for i, (_, row) in enumerate(team_picks.iterrows()):
-                board.at[i+1, team] = f"{row['Name']} ({row['Position']})"
+                board.at[i+1, team] = f"{row['name']} ({row['position']})"
         
         def color_board(val):
             if pd.isna(val) or val == "": return ''

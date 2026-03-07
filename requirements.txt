@@ -2,3 +2,4 @@ streamlit
 pandas
 requests
 plotly
+psycopg2-binary

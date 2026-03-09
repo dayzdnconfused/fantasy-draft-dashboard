@@ -298,7 +298,7 @@ st.sidebar.markdown("---")
 # --- DRAFT MANAGEMENT ---
 with st.sidebar.expander("Draft Management (Undo/Reset)"):
     
-    # --- NEW: 1-CLICK CSV BACKUP ---
+    # --- 1-CLICK CSV BACKUP ---
     st.markdown("**Backup Draft State**")
     conn = get_db_connection()
     backup_df = pd.read_sql_query("SELECT * FROM draft_picks ORDER BY id ASC", conn)
@@ -317,6 +317,44 @@ with st.sidebar.expander("Draft Management (Undo/Reset)"):
     else:
         st.info("No picks to backup yet.")
         
+    st.markdown("---")
+
+    # --- NEW: RESTORE FROM CSV ---
+    st.markdown("**Restore Draft State**")
+    uploaded_file = st.file_uploader("Upload a previous CSV backup", type=["csv"])
+    
+    if uploaded_file is not None:
+        if st.button("⚠️ Restore from Backup", type="primary"):
+            try:
+                restore_df = pd.read_csv(uploaded_file)
+                # Normalize columns to lowercase to match Postgres output
+                restore_df.columns = [col.lower() for col in restore_df.columns]
+                
+                required_cols = {'name', 'type', 'team', 'position'}
+                if required_cols.issubset(set(restore_df.columns)):
+                    conn = get_db_connection()
+                    c = conn.cursor()
+                    
+                    # 1. Wipe the current corrupted/empty board
+                    c.execute("DELETE FROM draft_picks")
+                    
+                    # 2. Re-insert the historical picks in exact chronological order
+                    for _, row in restore_df.iterrows():
+                        c.execute("INSERT INTO draft_picks (Name, Type, Team, Position) VALUES (%s, %s, %s, %s)",
+                                  (row['name'], row['type'], row['team'], row['position']))
+                        
+                    conn.commit()
+                    conn.close()
+                    
+                    st.cache_data.clear()
+                    st.session_state.batters, st.session_state.pitchers = load_data()
+                    st.success("Draft successfully restored!")
+                    st.rerun()
+                else:
+                    st.error("Invalid CSV format. Missing required columns.")
+            except Exception as e:
+                st.error(f"Error restoring draft: {e}")
+
     st.markdown("---")
     
     # --- EXISTING UNDO/RESET LOGIC ---

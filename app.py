@@ -134,29 +134,16 @@ def load_data():
     batters = pd.merge(batters, id_map_clean, on='PlayerId', how='left')
     pitchers = pd.merge(pitchers, id_map_clean, on='PlayerId', how='left')
 
+    # --- OFFICIAL MLB INJURY INTEGRATION ---
     injury_df = fetch_official_injury_status()
     
-    # TEST STEP 1: Print exactly how many players the MLB API found
-    st.sidebar.info(f"Diagnostics: MLB API found {len(injury_df)} injured players.")
-    
-    # TEST STEP 2: If the API is empty (Spring Training), inject fake data to test the merge
-    if len(injury_df) == 0:
-        st.sidebar.warning("Injecting fake injuries to test data pipeline...")
-        mock_data = pd.DataFrame([
-            {"Name": "Aaron Judge", "Injury_Status": "10-Day IL (Mock Data)"},
-            {"Name": "Shohei Ohtani", "Injury_Status": "60-Day IL (Mock Data)"}
-        ])
-        injury_df = pd.concat([injury_df, mock_data], ignore_index=True)
-    
-    # --- The standard merge logic (incorporating the name normalization fix) ---
     if not injury_df.empty:
-        # We define the normalization function directly inside load_data for the test
         import unicodedata
         def normalize_name(name):
             if pd.isna(name): return ""
             name = unicodedata.normalize('NFKD', str(name)).encode('ASCII', 'ignore').decode('utf-8')
             return name.lower().strip().replace('.', '').replace("'", "").replace("-", " ")
-            
+
         batters['Merge_Name'] = batters['Name'].apply(normalize_name)
         pitchers['Merge_Name'] = pitchers['Name'].apply(normalize_name)
         injury_df['Merge_Name'] = injury_df['Name'].apply(normalize_name)
@@ -169,6 +156,20 @@ def load_data():
     else:
         batters['Injury_Status'] = ""
         pitchers['Injury_Status'] = ""
+
+    # Calculate Total Bases
+    if all(col in batters.columns for col in ['H', '2B', '3B', 'HR']):
+        batters['TB'] = batters['H'] + batters['2B'] + (2 * batters['3B']) + (3 * batters['HR'])
+    
+    # Restore the K vs SO variables
+    k_col_b = 'K' if 'K' in batters.columns else 'SO'
+    k_col_p = 'K' if 'K' in pitchers.columns else 'SO'
+    
+    # Calculate Custom Fantasy Points
+    batters['Total_Points'] = (
+        batters['R'] * 1 + batters.get('TB', 0) * 1 + batters['RBI'] * 1 +
+        batters['BB'] * 1 + batters[k_col_b] * -1 + batters['SB'] * 1
+    )
     
     pitchers['Total_Points'] = (
         pitchers['IP'] * 3 + pitchers['H'] * -1 + pitchers['ER'] * -2 +
@@ -189,7 +190,6 @@ def load_data():
     conn.close()
             
     for index, row in state_df.iterrows():
-        # Using Postgres lowercase column names from pandas output
         name = row['name']
         team = row['team']
         pos = row['position']

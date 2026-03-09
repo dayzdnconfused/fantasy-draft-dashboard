@@ -113,7 +113,8 @@ def load_teams():
     return teams
 
 @st.cache_data
-def load_data():
+def load_base_data():
+    """Heavy lifting: Parses CSVs, merges injuries, and calculates math. Cached for speed."""
     if not os.path.exists("the_bat_x_batters.csv") or not os.path.exists("atc_pitchers.csv") or not os.path.exists("id_map.csv"):
         st.error("Data files missing! Please ensure the_bat_x_batters.csv, atc_pitchers.csv, and id_map.csv are pushed to your GitHub repository.")
         st.stop()
@@ -135,7 +136,6 @@ def load_data():
     batters = pd.merge(batters, id_map_clean, on='PlayerId', how='left')
     pitchers = pd.merge(pitchers, id_map_clean, on='PlayerId', how='left')
 
-    # --- OFFICIAL MLB INJURY INTEGRATION ---
     injury_df = fetch_official_injury_status()
     
     if not injury_df.empty:
@@ -158,15 +158,12 @@ def load_data():
         batters['Injury_Status'] = ""
         pitchers['Injury_Status'] = ""
 
-    # Calculate Total Bases
     if all(col in batters.columns for col in ['H', '2B', '3B', 'HR']):
         batters['TB'] = batters['H'] + batters['2B'] + (2 * batters['3B']) + (3 * batters['HR'])
     
-    # Restore the K vs SO variables
     k_col_b = 'K' if 'K' in batters.columns else 'SO'
     k_col_p = 'K' if 'K' in pitchers.columns else 'SO'
     
-    # Calculate Custom Fantasy Points
     batters['Total_Points'] = (
         batters['R'] * 1 + batters.get('TB', 0) * 1 + batters['RBI'] * 1 +
         batters['BB'] * 1 + batters[k_col_b] * -1 + batters['SB'] * 1
@@ -186,6 +183,10 @@ def load_data():
     batters['Drafted_Pos'] = None
     pitchers['Drafted_Pos'] = None
     
+    return batters, pitchers
+
+def sync_draft_state(batters, pitchers):
+    """Live Sync: Queries Postgres to update drafted players. NO cache decorator!"""
     conn = get_db_connection()
     state_df = pd.read_sql_query("SELECT * FROM draft_picks", conn)
     conn.close()
@@ -217,8 +218,8 @@ st.title("2026 Fantasy Baseball Draft Room")
 if 'teams' not in st.session_state:
     st.session_state.teams = load_teams()
 
-if 'batters' not in st.session_state:
-    st.session_state.batters, st.session_state.pitchers = load_data()
+base_batters, base_pitchers = load_base_data()
+st.session_state.batters, st.session_state.pitchers = sync_draft_state(base_batters.copy(), base_pitchers.copy())
 
 drafted_batters = st.session_state.batters[st.session_state.batters['Drafted_By'] != "Available"]
 drafted_pitchers = st.session_state.pitchers[st.session_state.pitchers['Drafted_By'] != "Available"]
@@ -347,8 +348,6 @@ with st.sidebar.expander("Draft Management (Undo/Reset)"):
                     conn.commit()
                     conn.close()
                     
-                    st.cache_data.clear()
-                    st.session_state.batters, st.session_state.pitchers = load_data()
                     st.success("Draft successfully restored!")
                     st.rerun()
                 else:

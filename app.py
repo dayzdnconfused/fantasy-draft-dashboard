@@ -15,10 +15,10 @@ def get_db_connection():
     return psycopg2.connect(st.secrets["DATABASE_URL"])
 
 # --- PHASE 0: DATABASE INITIALIZATION ---
+@st.cache_resource
 def init_db():
     conn = get_db_connection()
     c = conn.cursor()
-    # Postgres uses SERIAL PRIMARY KEY to auto-increment IDs for safe undo functionality
     c.execute('''CREATE TABLE IF NOT EXISTS draft_picks
                  (id SERIAL PRIMARY KEY, Name TEXT, Type TEXT, Team TEXT, Position TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS teams
@@ -103,9 +103,10 @@ def fetch_official_injury_status():
         
     return pd.DataFrame(columns=['Name', 'Injury_Status'])
 
+@st.cache_data
 def load_teams():
     conn = get_db_connection()
-    teams = pd.read_sql_query("SELECT TeamName FROM teams", conn)['teamname'].tolist() # Postgres returns lowercase columns automatically
+    teams = pd.read_sql_query("SELECT TeamName FROM teams", conn)['teamname'].tolist()
     conn.close()
     if not teams:
         return [f"Team {i}" for i in range(1, 11)]
@@ -405,6 +406,9 @@ with st.sidebar.expander("Customize Team Names"):
             c.execute("INSERT INTO teams (TeamName) VALUES (%s)", (t,))
         conn.commit()
         conn.close()
+        
+        load_teams.clear() # <--- NEW: Forces the app to read the updated names
+        
         st.session_state.teams = new_teams
         st.success("Teams saved!")
         st.rerun()

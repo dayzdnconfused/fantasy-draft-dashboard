@@ -466,6 +466,15 @@ with tab1:
     if view_type == "Batters":
         df = st.session_state.batters[st.session_state.batters['Drafted_By'] == "Available"].copy()
         if 'Pos' in df.columns:
+            # --- FIX 1: DYNAMIC SCATTER PLOT ---
+            # Determine Primary Position (e.g., 'C' from 'C/1B') for accurate baseline mapping
+            df['Primary_Pos'] = df['Pos'].astype(str).str.split('/').str[0]
+            df['Player_Baseline'] = df['Primary_Pos'].map(baselines).fillna(baselines.get('UTIL', 0.001))
+            
+            # Calculate True VOA and RPV based on their specific positional baseline
+            df['VOA'] = df['Total_Points'] - df['Player_Baseline']
+            df['RPV'] = (df['VOA'] / df['Player_Baseline']) * 100
+            
             positions = ["All", "C", "1B", "2B", "3B", "SS", "OF", "UTIL"]
             col1, col2 = st.columns([1, 4])
             with col1:
@@ -473,25 +482,33 @@ with tab1:
             
             if pos_filter != "All" and pos_filter != "UTIL":
                 df = df[df['Pos'].astype(str).str.contains(pos_filter, na=False)]
-                
-            active_baseline = baselines.get('UTIL', 0.001) if pos_filter == "All" else baselines.get(pos_filter, 0.001)
-            df['VOA'] = df['Total_Points'] - active_baseline
-            df['RPV'] = (df['VOA'] / active_baseline) * 100 
             
             with st.expander("📊 View True Value Scatter Plot (Top 150)", expanded=False):
                 scatter_df = df.sort_values('VOA', ascending=False).head(150)
-                fig_scatter = px.scatter(scatter_df, x="Total_Points", y="RPV", color="Pos", hover_name="Name", 
+                fig_scatter = px.scatter(scatter_df, x="Total_Points", y="RPV", color="Primary_Pos", hover_name="Name", 
                                          title=f"Total Points vs. RPV% (Available {pos_filter} Batters)",
-                                         labels={"Total_Points": "Total Projected Points", "RPV": "RPV (%)"})
+                                         labels={"Total_Points": "Total Projected Points", "RPV": "RPV (%)", "Primary_Pos": "Primary Position"})
                 fig_scatter.update_layout(height=400)
                 st.plotly_chart(fig_scatter, use_container_width=True)
             
-            with st.expander(f"📉 View Positional Scarcity Cliff ({pos_filter})", expanded=True):
-                top_10 = df.sort_values('VOA', ascending=False).head(10)
-                fig_cliff = px.line(top_10, x="Name", y="VOA", markers=True, 
-                                    title=f"Top 10 Remaining {pos_filter} - VOA Drop-off",
-                                    labels={"Name": "Player", "VOA": "Value Over Average"})
-                fig_cliff.update_traces(line_color='#00b4d8', marker=dict(size=10, color='#0077b6'))
+            # --- FIX 2: BIRD'S-EYE CLIFF CHART ---
+            with st.expander(f"📉 View Bird's-Eye Positional Scarcity Cliff", expanded=True):
+                cliff_data = {}
+                target_positions = ['C', '1B', '2B', '3B', 'SS', 'OF'] if pos_filter == "All" or pos_filter == "UTIL" else [pos_filter]
+                
+                for pos in target_positions:
+                    pos_df = st.session_state.batters[(st.session_state.batters['Drafted_By'] == "Available") & (st.session_state.batters['Pos'].astype(str).str.contains(pos, na=False))].copy()
+                    pos_df['Player_Baseline'] = baselines.get(pos, 0.001)
+                    pos_df['VOA'] = pos_df['Total_Points'] - pos_df['Player_Baseline']
+                    top_10_voa = pos_df.sort_values('VOA', ascending=False)['VOA'].head(10).tolist()
+                    top_10_voa += [None] * (10 - len(top_10_voa)) # Pad if fewer than 10 remain
+                    cliff_data[pos] = top_10_voa
+                
+                cliff_df = pd.DataFrame(cliff_data, index=range(1, 11))
+                
+                fig_cliff = px.line(cliff_df, markers=True, 
+                                    title=f"Top 10 Available - VOA Drop-off by Position",
+                                    labels={"index": "Best Available Rank (1st to 10th)", "value": "Value Over Average (VOA)", "variable": "Position"})
                 st.plotly_chart(fig_cliff, use_container_width=True)
             
             k_col = 'K' if 'K' in df.columns else 'SO'
@@ -499,9 +516,19 @@ with tab1:
             st.dataframe(df[display_cols].sort_values(by="VOA", ascending=False),
                          column_config={"VOA": st.column_config.NumberColumn("VOA (+/-)", format="%.1f"), "RPV": st.column_config.NumberColumn("RPV", format="%.1f%%")},
                          hide_index=True)
+                         
     else:
         df = st.session_state.pitchers[st.session_state.pitchers['Drafted_By'] == "Available"].copy()
         if 'Pos' in df.columns:
+            # Determine Primary Position
+            df['Primary_Pos'] = df['Pos'].astype(str).str.split('/').str[0]
+            df['Primary_Pos'] = df['Primary_Pos'].replace('P', 'SP') # Catch edge cases
+            df['Player_Baseline'] = df['Primary_Pos'].map(baselines).fillna(baselines.get('SP', 0.001))
+            
+            # Calculate True VOA and RPV
+            df['VOA'] = df['Total_Points'] - df['Player_Baseline']
+            df['RPV'] = (df['VOA'] / df['Player_Baseline']) * 100
+
             positions = ["All", "SP", "RP"]
             col1, col2 = st.columns([1, 4])
             with col1:
@@ -510,24 +537,31 @@ with tab1:
             if pos_filter != "All":
                  df = df[df['Pos'].astype(str).str.contains(pos_filter, na=False)] 
             
-            active_baseline = baselines.get('SP', 0.001) if pos_filter == "All" else baselines.get(pos_filter, 0.001)
-            df['VOA'] = df['Total_Points'] - active_baseline
-            df['RPV'] = (df['VOA'] / active_baseline) * 100
-            
             with st.expander("📊 View True Value Scatter Plot (Top 100)", expanded=False):
                 scatter_df = df.sort_values('VOA', ascending=False).head(100)
-                fig_scatter = px.scatter(scatter_df, x="Total_Points", y="RPV", color="Pos", hover_name="Name", 
+                fig_scatter = px.scatter(scatter_df, x="Total_Points", y="RPV", color="Primary_Pos", hover_name="Name", 
                                          title=f"Total Points vs. RPV% (Available {pos_filter} Pitchers)",
-                                         labels={"Total_Points": "Total Projected Points", "RPV": "RPV (%)"})
+                                         labels={"Total_Points": "Total Projected Points", "RPV": "RPV (%)", "Primary_Pos": "Primary Position"})
                 fig_scatter.update_layout(height=400)
                 st.plotly_chart(fig_scatter, use_container_width=True)
             
-            with st.expander(f"📉 View Positional Scarcity Cliff ({pos_filter})", expanded=True):
-                top_10 = df.sort_values('VOA', ascending=False).head(10)
-                fig_cliff = px.line(top_10, x="Name", y="VOA", markers=True, 
-                                    title=f"Top 10 Remaining {pos_filter} - VOA Drop-off",
-                                    labels={"Name": "Player", "VOA": "Value Over Average"})
-                fig_cliff.update_traces(line_color='#ff9f1c', marker=dict(size=10, color='#e07a5f'))
+            with st.expander(f"📉 View Bird's-Eye Positional Scarcity Cliff", expanded=True):
+                cliff_data = {}
+                target_positions = ['SP', 'RP'] if pos_filter == "All" else [pos_filter]
+                
+                for pos in target_positions:
+                    pos_df = st.session_state.pitchers[(st.session_state.pitchers['Drafted_By'] == "Available") & (st.session_state.pitchers['Pos'].astype(str).str.contains(pos, na=False))].copy()
+                    pos_df['Player_Baseline'] = baselines.get(pos, 0.001)
+                    pos_df['VOA'] = pos_df['Total_Points'] - pos_df['Player_Baseline']
+                    top_10_voa = pos_df.sort_values('VOA', ascending=False)['VOA'].head(10).tolist()
+                    top_10_voa += [None] * (10 - len(top_10_voa))
+                    cliff_data[pos] = top_10_voa
+                
+                cliff_df = pd.DataFrame(cliff_data, index=range(1, 11))
+                
+                fig_cliff = px.line(cliff_df, markers=True, 
+                                    title=f"Top 10 Available - VOA Drop-off by Position",
+                                    labels={"index": "Best Available Rank (1st to 10th)", "value": "Value Over Average (VOA)", "variable": "Position"})
                 st.plotly_chart(fig_cliff, use_container_width=True)
 
             k_col = 'K' if 'K' in df.columns else 'SO'

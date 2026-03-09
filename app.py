@@ -297,6 +297,29 @@ st.sidebar.markdown("---")
 
 # --- DRAFT MANAGEMENT ---
 with st.sidebar.expander("Draft Management (Undo/Reset)"):
+    
+    # --- NEW: 1-CLICK CSV BACKUP ---
+    st.markdown("**Backup Draft State**")
+    conn = get_db_connection()
+    backup_df = pd.read_sql_query("SELECT * FROM draft_picks ORDER BY id ASC", conn)
+    conn.close()
+    
+    if not backup_df.empty:
+        csv_backup = backup_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="💾 Download Draft Backup (CSV)",
+            data=csv_backup,
+            file_name=f"draft_backup_pick_{total_drafted}.csv",
+            mime="text/csv",
+            type="primary",
+            help="Downloads a permanent CSV file of every pick made so far."
+        )
+    else:
+        st.info("No picks to backup yet.")
+        
+    st.markdown("---")
+    
+    # --- EXISTING UNDO/RESET LOGIC ---
     if st.button("Undo Last Pick"):
         conn = get_db_connection()
         c = conn.cursor()

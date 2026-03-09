@@ -442,14 +442,18 @@ with st.sidebar.expander("ETL & Data Sync"):
             success = fetch_fangraphs_projections()
             if success:
                 st.cache_data.clear()
-                st.session_state.batters, st.session_state.pitchers = load_data()
+                # NEW: Use the two-step load and sync process
+                base_batters, base_pitchers = load_base_data()
+                st.session_state.batters, st.session_state.pitchers = sync_draft_state(base_batters.copy(), base_pitchers.copy())
                 st.success("Projections Synced & Reloaded!")
             else:
                 st.error("Failed to fetch data. Check your connection.")
     
     if st.button("Refresh Code Cache"):
         st.cache_data.clear()
-        st.session_state.batters, st.session_state.pitchers = load_data()
+        # NEW: Use the two-step load and sync process
+        base_batters, base_pitchers = load_base_data()
+        st.session_state.batters, st.session_state.pitchers = sync_draft_state(base_batters.copy(), base_pitchers.copy())
         st.success("Cache Cleared!")
 
 # --- MAIN DASHBOARD ---

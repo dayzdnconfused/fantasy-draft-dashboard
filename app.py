@@ -172,7 +172,7 @@ def load_data():
     )
     
     pitchers['Total_Points'] = (
-        pitchers['IP'] * 3 + pitchers['H'] * -1 + pitchers['ER'] * -2 +
+        pitchers['IP'] * 3 + pitchers['H'] * -1 + pitchers['ER'] * -1 +
         pitchers['BB'] * -1 + pitchers[k_col_p] * 1 + pitchers.get('QS', 0) * 1 +
         pitchers['W'] * 2 + pitchers['L'] * -2 + pitchers.get('SV', 0) * 5 + pitchers.get('HLD', 0) * 2
     )

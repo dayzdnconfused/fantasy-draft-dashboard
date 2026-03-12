@@ -263,7 +263,7 @@ if selected_player:
         pos_options = str(raw_pos).split('/') + ['UTIL']
     else:
         raw_pos = st.session_state.pitchers.loc[st.session_state.pitchers['Name'] == selected_player, 'Pos'].values[0]
-        pos_options = str(raw_pos).split('/')
+        pos_options = str(raw_pos).split('/') + ['P'] # <-- NEW: Append 'P' to pitcher options
         
     selected_pos = st.sidebar.selectbox("Draft As (Position)", pos_options)
 
@@ -321,7 +321,7 @@ with st.sidebar.expander("Draft Management (Undo/Reset)"):
         
     st.markdown("---")
 
-    # --- NEW: RESTORE FROM CSV ---
+    # --- RESTORE FROM CSV ---
     st.markdown("**Restore Draft State**")
     uploaded_file = st.file_uploader("Upload a previous CSV backup", type=["csv"])
     
@@ -357,7 +357,7 @@ with st.sidebar.expander("Draft Management (Undo/Reset)"):
 
     st.markdown("---")
     
-    # --- EXISTING UNDO/RESET LOGIC ---
+    # --- UNDO LOGIC ---
     if st.button("Undo Last Pick"):
         conn = get_db_connection()
         c = conn.cursor()
@@ -368,8 +368,6 @@ with st.sidebar.expander("Draft Management (Undo/Reset)"):
             row_id, player_name = last_pick
             c.execute("DELETE FROM draft_picks WHERE id = %s", (row_id,))
             conn.commit()
-            st.cache_data.clear()
-            st.session_state.batters, st.session_state.pitchers = load_data()
             st.success(f"Successfully undid pick: {player_name}")
         else:
             st.warning("No picks to undo.")
@@ -378,14 +376,13 @@ with st.sidebar.expander("Draft Management (Undo/Reset)"):
 
     st.markdown("---")
     
+    # --- RESET LOGIC ---
     if st.button("🧨 Reset Entire Draft"):
         conn = get_db_connection()
         c = conn.cursor()
         c.execute("DELETE FROM draft_picks")
         conn.commit()
         conn.close()
-        st.cache_data.clear()
-        st.session_state.batters, st.session_state.pitchers = load_data()
         st.success("Draft completely reset!")
         st.rerun()
 
@@ -455,6 +452,39 @@ with st.sidebar.expander("ETL & Data Sync"):
         base_batters, base_pitchers = load_base_data()
         st.session_state.batters, st.session_state.pitchers = sync_draft_state(base_batters.copy(), base_pitchers.copy())
         st.success("Cache Cleared!")
+
+# --- ROSTER LIMITS & BENCH LOGIC ---
+ROSTER_LIMITS = {
+    'C': 1, '1B': 1, '2B': 1, '3B': 1, 'SS': 1, 'OF': 3, 'UTIL': 1, 
+    'SP': 99,  # Forces all SPs to be active "Starters" in the points calculation
+    'RP': 3, 
+    'P': 1,    # NEW: The Pitcher flex slot
+    'UTIL/SP': 1 
+}
+
+def assign_roster_status(df, limits):
+    """Sorts players by points, fills starting roster limits, and pushes the rest to the bench."""
+    if df.empty:
+        df['Roster_Status'] = 'Starter'
+        return df
+    
+    df = df.copy()
+    # Sort highest points first so the best players get the starting slots
+    df = df.sort_values(by='Total_Points', ascending=False)
+    df['Roster_Status'] = 'Bench'
+    
+    for team in df['Drafted_By'].unique():
+        for pos, limit in limits.items():
+            mask = (df['Drafted_By'] == team) & (df['Drafted_Pos'] == pos)
+            # Take the top N players for this position and flag them as Starters
+            starters_idx = df[mask].head(limit).index
+            df.loc[starters_idx, 'Roster_Status'] = 'Starter'
+            
+    return df
+
+# Apply bench logic to all currently drafted players
+drafted_batters = assign_roster_status(drafted_batters, ROSTER_LIMITS)
+drafted_pitchers = assign_roster_status(drafted_pitchers, ROSTER_LIMITS)
 
 # --- MAIN DASHBOARD ---
 tab1, tab2, tab3, tab4 = st.tabs(["Available Players", "Team Rosters", "League Standings", "Draft Board"])
@@ -578,51 +608,57 @@ with tab2:
     st.header("Team Summaries & Analysis")
     team_view = st.selectbox("Select Team to View", st.session_state.teams)
     
-    team_batters = st.session_state.batters[st.session_state.batters['Drafted_By'] == team_view]
-    team_pitchers = st.session_state.pitchers[st.session_state.pitchers['Drafted_By'] == team_view]
+    team_batters = drafted_batters[drafted_batters['Drafted_By'] == team_view].copy()
+    team_pitchers = drafted_pitchers[drafted_pitchers['Drafted_By'] == team_view].copy()
     
-    total_proj_points = team_batters['Total_Points'].sum() + team_pitchers['Total_Points'].sum()
-    total_weekly_avg = team_batters['Weekly_Avg'].sum() + team_pitchers['Weekly_Avg'].sum()
+    # Feature 3: Calculate Starting Points vs Bench Points
+    team_all = pd.concat([team_batters, team_pitchers])
+    starting_pts = team_all[team_all['Roster_Status'] == 'Starter']['Total_Points'].sum() if not team_all.empty else 0
+    bench_pts = team_all[team_all['Roster_Status'] == 'Bench']['Total_Points'].sum() if not team_all.empty else 0
+    total_proj_points = starting_pts + bench_pts
     
-    col1, col2 = st.columns(2)
-    col1.metric("Projected Total Points", f"{total_proj_points:.2f}")
-    col2.metric("Projected Weekly Average", f"{total_weekly_avg:.2f}")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Starting Lineup Points", f"{starting_pts:.2f}")
+    col2.metric("Bench Points", f"{bench_pts:.2f}")
+    col3.metric("Total Roster Points", f"{total_proj_points:.2f}")
     
-    st.markdown("---")
-    st.subheader("Roster Balance Analysis")
-    
-    league_bat_pts = drafted_batters['Total_Points'].sum() if not drafted_batters.empty else 0
-    league_pit_pts = drafted_pitchers['Total_Points'].sum() if not drafted_pitchers.empty else 0
-    league_total = league_bat_pts + league_pit_pts
-    
-    team_bat_pts = team_batters['Total_Points'].sum()
-    team_pit_pts = team_pitchers['Total_Points'].sum()
-    
-    col_chart1, col_chart2 = st.columns(2)
-    with col_chart1:
-        if total_proj_points > 0:
-            fig_team = go.Figure(data=[go.Pie(labels=['Hitting', 'Pitching'], values=[team_bat_pts, team_pit_pts], hole=.4, marker_colors=['#4361ee', '#f72585'])])
-            fig_team.update_layout(title_text=f"{team_view} Point Split", title_x=0.5)
-            st.plotly_chart(fig_team, use_container_width=True)
-        else:
-            st.info(f"Draft players to {team_view} to see balance.")
-            
-    with col_chart2:
-        if league_total > 0:
-            fig_lg = go.Figure(data=[go.Pie(labels=['Hitting', 'Pitching'], values=[league_bat_pts, league_pit_pts], hole=.4, marker_colors=['#4361ee', '#f72585'])])
-            fig_lg.update_layout(title_text="League Average Point Split", title_x=0.5)
-            st.plotly_chart(fig_lg, use_container_width=True)
-        else:
-            st.info("Draft players to see the league average balance.")
+    # Feature 2: Edit Positions UI
+    with st.expander(f"⚙️ Edit {team_view} Player Positions"):
+        if not team_all.empty:
+            edit_player = st.selectbox("Select Player to Edit", team_all['Name'].tolist())
+            if edit_player:
+                player_row = team_all[team_all['Name'] == edit_player].iloc[0]
+                current_pos = player_row['Drafted_Pos']
+                # Get raw eligible positions, add UTIL for batters, and P for pitchers
+                eligible_pos = str(player_row['Pos']).split('/')
+                if player_row.get('type', 'Batter') == 'Batter' and 'UTIL' not in eligible_pos:
+                    eligible_pos.append('UTIL')
+                elif player_row.get('type', 'Batter') == 'Pitcher' and 'P' not in eligible_pos:
+                    eligible_pos.append('P') # <-- NEW: Allow P in the editor
+                
+                # Ensure the current position is in the list just in case
+                pos_options = list(set(eligible_pos + [current_pos]))
+                new_pos = st.selectbox("Assign New Position", pos_options, index=pos_options.index(current_pos))
+                
+                if st.button("Update Position", type="primary"):
+                    conn = get_db_connection()
+                    c = conn.cursor()
+                    c.execute("UPDATE draft_picks SET Position = %s WHERE Name = %s AND Team = %s", (new_pos, edit_player, team_view))
+                    conn.commit()
+                    conn.close()
+                    st.success(f"Updated {edit_player} to {new_pos}!")
+                    st.rerun()
+
     st.markdown("---")
 
+    # Display tables with Eligible Positions (Pos) and Starter/Bench Status
     st.subheader("Hitters")
-    hitter_display = ['Name', 'Drafted_Pos', 'Total_Points', 'Weekly_Avg'] if 'Drafted_Pos' in team_batters.columns else ['Name', 'Total_Points', 'Weekly_Avg']
-    st.dataframe(team_batters[hitter_display], hide_index=True)
+    hitter_display = ['Name', 'Roster_Status', 'Drafted_Pos', 'Pos', 'Total_Points', 'Weekly_Avg'] 
+    st.dataframe(team_batters[hitter_display].sort_values(by=['Roster_Status', 'Total_Points'], ascending=[False, False]), hide_index=True, use_container_width=True)
     
     st.subheader("Pitchers")
-    pitcher_display = ['Name', 'Drafted_Pos', 'Total_Points', 'Weekly_Avg'] if 'Drafted_Pos' in team_pitchers.columns else ['Name', 'Total_Points', 'Weekly_Avg']
-    st.dataframe(team_pitchers[pitcher_display], hide_index=True)
+    pitcher_display = ['Name', 'Roster_Status', 'Drafted_Pos', 'Pos', 'Total_Points', 'Weekly_Avg'] 
+    st.dataframe(team_pitchers[pitcher_display].sort_values(by=['Roster_Status', 'Total_Points'], ascending=[False, False]), hide_index=True, use_container_width=True)
 
 with tab3:
     st.header("Live League Standings")
@@ -636,28 +672,45 @@ with tab3:
         alloc_df = pd.concat([dbat, dpit])
         
         alloc_grouped = alloc_df.groupby(['Drafted_By', 'Drafted_Pos'])['Total_Points'].sum().reset_index()
+
+        # Feature 1: Custom Sorting Order for the X-Ray Chart
+        custom_order = ['SP', 'RP', 'P', 'C', '1B', '2B', 'SS', '3B', 'OF', 'UTIL', 'UTIL/SP']
         
         fig_alloc = px.bar(alloc_grouped, y='Drafted_By', x='Total_Points', color='Drafted_Pos', 
                            orientation='h', title="Projected Points by Position per Team",
-                           labels={'Drafted_By': 'Team', 'Total_Points': 'Total Projected Points'})
+                           labels={'Drafted_By': 'Team', 'Total_Points': 'Total Projected Points'},
+                           category_orders={'Drafted_Pos': custom_order}) # Apply custom sorting
+                           
         fig_alloc.update_layout(barmode='stack', yaxis={'categoryorder':'total ascending'}, height=500)
         st.plotly_chart(fig_alloc, use_container_width=True)
         st.markdown("---")
 
-        b_standings = pd.DataFrame()
-        if not drafted_batters.empty:
-            b_standings = drafted_batters.groupby('Drafted_By')[['Total_Points', 'Weekly_Avg']].sum().reset_index()
-            
-        p_standings = pd.DataFrame()
-        if not drafted_pitchers.empty:
-            p_standings = drafted_pitchers.groupby('Drafted_By')[['Total_Points', 'Weekly_Avg']].sum().reset_index()
-            
-        combined = pd.concat([b_standings, p_standings])
-        league_standings = combined.groupby('Drafted_By')[['Total_Points', 'Weekly_Avg']].sum().reset_index()
-        league_standings = league_standings.rename(columns={'Drafted_By': 'Team', 'Total_Points': 'Proj Total Points', 'Weekly_Avg': 'Proj Weekly Avg'})
+        # Feature 3: Calculate True Standings (Starters Only)
+        combined_drafted = pd.concat([drafted_batters, drafted_pitchers])
+        
+        # 1. Sum up Starting Points
+        starters_df = combined_drafted[combined_drafted['Roster_Status'] == 'Starter']
+        standings = starters_df.groupby('Drafted_By')[['Total_Points', 'Weekly_Avg']].sum().reset_index()
+        standings = standings.rename(columns={'Drafted_By': 'Team', 'Total_Points': 'Starting Proj Points', 'Weekly_Avg': 'Starting Weekly Avg'})
+        
+        # 2. Sum up Bench Points separately
+        bench_df = combined_drafted[combined_drafted['Roster_Status'] == 'Bench']
+        if not bench_df.empty:
+            bench_pts = bench_df.groupby('Drafted_By')['Total_Points'].sum().reset_index()
+            bench_pts = bench_pts.rename(columns={'Drafted_By': 'Team', 'Total_Points': 'Bench Points'})
+            # Merge them together
+            standings = pd.merge(standings, bench_pts, on='Team', how='left').fillna(0)
+        else:
+            standings['Bench Points'] = 0.0
+
+        st.subheader("True League Standings (Optimized Starting Lineups)")
         st.dataframe(
-            league_standings.sort_values(by='Proj Total Points', ascending=False),
-            column_config={"Proj Total Points": st.column_config.NumberColumn(format="%.2f"), "Proj Weekly Avg": st.column_config.NumberColumn(format="%.2f")},
+            standings.sort_values(by='Starting Proj Points', ascending=False),
+            column_config={
+                "Starting Proj Points": st.column_config.NumberColumn(format="%.2f"), 
+                "Starting Weekly Avg": st.column_config.NumberColumn(format="%.2f"),
+                "Bench Points": st.column_config.NumberColumn(format="%.2f")
+            },
             hide_index=True, use_container_width=True 
         )
 

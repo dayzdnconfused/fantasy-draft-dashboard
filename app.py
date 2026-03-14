@@ -23,6 +23,8 @@ def init_db():
                  (id SERIAL PRIMARY KEY, Name TEXT, Type TEXT, Team TEXT, Position TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS teams
                  (TeamName TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS position_overrides
+                 (Name TEXT PRIMARY KEY, Pos TEXT)''')
     conn.commit()
     conn.close()
 
@@ -186,8 +188,17 @@ def load_base_data():
     return batters, pitchers
 
 def sync_draft_state(batters, pitchers):
-    """Live Sync: Queries Postgres to update drafted players. NO cache decorator!"""
+    """Live Sync: Queries Postgres to update drafted players and apply position corrections."""
     conn = get_db_connection()
+    
+    # 1. NEW: Apply Position Overrides first
+    overrides_df = pd.read_sql_query("SELECT name, pos FROM position_overrides", conn)
+    if not overrides_df.empty:
+        override_dict = dict(zip(overrides_df['name'], overrides_df['pos']))
+        batters['Pos'] = batters['Name'].map(override_dict).fillna(batters['Pos'])
+        pitchers['Pos'] = pitchers['Name'].map(override_dict).fillna(pitchers['Pos'])
+        
+    # 2. Existing Draft State Logic
     state_df = pd.read_sql_query("SELECT * FROM draft_picks", conn)
     conn.close()
             
@@ -432,6 +443,49 @@ if baseline_mode == "Dynamic (Available Only)":
     baselines = calculate_baselines(avail_batters, avail_pitchers, current_pools)
 else:
     baselines = calculate_baselines(st.session_state.batters, st.session_state.pitchers, current_pools)
+
+# --- POSITIONAL ELIGIBILITY OVERRIDES ---
+    with st.sidebar.expander("🛠️ Correct Player Eligibility"):
+        st.markdown("Fix missing or incorrect positions.")
+        
+        # Combine all names for the dropdown
+        all_players = sorted(list(set(st.session_state.batters['Name'].tolist() + st.session_state.pitchers['Name'].tolist())))
+        fix_player = st.selectbox("Select Player to Fix", [""] + all_players)
+        
+        if fix_player:
+            # Check if batter or pitcher to grab current pos
+            is_batter = fix_player in st.session_state.batters['Name'].values
+            if is_batter:
+                current_pos = st.session_state.batters[st.session_state.batters['Name'] == fix_player]['Pos'].values[0]
+            else:
+                current_pos = st.session_state.pitchers[st.session_state.pitchers['Name'] == fix_player]['Pos'].values[0]
+            
+            st.write(f"Current Position(s): **{current_pos}**")
+            
+            # The strict validation constraint list
+            valid_positions = ['C', '1B', '2B', '3B', 'SS', 'OF', 'UTIL', 'SP', 'RP', 'P']
+            current_list = [p for p in str(current_pos).split('/') if p in valid_positions]
+            
+            # The Multi-Select Widget
+            new_positions = st.multiselect("Select ALL Eligible Positions:", valid_positions, default=current_list)
+            
+            if st.button("Save Correction"):
+                if new_positions:
+                    new_pos_string = "/".join(new_positions)
+                    conn = get_db_connection()
+                    c = conn.cursor()
+                    # Upsert: Inserts the new string, or updates it if the player already exists
+                    c.execute("""
+                        INSERT INTO position_overrides (Name, Pos) 
+                        VALUES (%s, %s) 
+                        ON CONFLICT (Name) DO UPDATE SET Pos = EXCLUDED.Pos
+                    """, (fix_player, new_pos_string))
+                    conn.commit()
+                    conn.close()
+                    st.success(f"Updated {fix_player} to {new_pos_string}!")
+                    st.rerun()
+                else:
+                    st.error("Please select at least one valid position tag.")
 
 with st.sidebar.expander("ETL & Data Sync"):
     if st.button("Download Latest Projections"):

@@ -6,7 +6,12 @@ import re
 
 st.set_page_config(page_title="In-Season Manager", layout="wide")
 
-# --- ESPN API DIRECT INTEGRATION ---
+# --- 1. INITIALIZE MEMORY (The Bug Fix) ---
+# This guarantees the app never throws an AttributeError on boot.
+if 'rosters' not in st.session_state:
+    st.session_state['rosters'] = None
+
+# --- 2. ESPN API DIRECT INTEGRATION ---
 def fetch_espn_rosters():
     st.sidebar.header("1. Sync League Rosters")
     st.sidebar.markdown("Pull live rosters directly from ESPN's hidden API.")
@@ -41,18 +46,17 @@ def fetch_espn_rosters():
                             })
                     
                     df = pd.DataFrame(rostered_players)
-                    # Create a cleaned-up name column for perfect cross-referencing
                     df['Match_Name'] = df['Player_Name'].str.lower().str.replace(r'[^a-z ]', '', regex=True)
                     
-                    # Save to session state
-                    st.session_state.rosters = df
+                    # Safely save to dictionary state
+                    st.session_state['rosters'] = df
                     st.sidebar.success(f"Successfully pulled {len(df)} rostered players directly from ESPN!")
                 else:
                     st.sidebar.error(f"ESPN API Failed: Status {response.status_code}. Check your S2 and SWID cookies.")
             except Exception as e:
                 st.sidebar.error(f"API Connection Error: {e}")
 
-# --- PITCHER LIST SCRAPER ---
+# --- 3. PITCHER LIST SCRAPER ---
 def scrape_pitcher_list(url):
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     try:
@@ -69,7 +73,7 @@ def scrape_pitcher_list(url):
         st.error(f"Failed to scrape URL: {e}")
         return pd.DataFrame()
 
-# --- THE WAIVER WIRE SCANNER UI ---
+# --- 4. THE WAIVER WIRE SCANNER UI ---
 def ui_pitcher_list_scanner():
     st.header("Pitcher List Waiver Wire Scanner")
     st.markdown("Paste the URL of this week's 'The List'. The app will scrape the rankings and find exactly who is sitting on your waiver wire.")
@@ -77,8 +81,9 @@ def ui_pitcher_list_scanner():
     pl_url = st.text_input("Pitcher List Article URL:")
     
     if st.button("Scan the Wire"):
-        if 'rosters' not in st.session_state:
-            st.warning("Please click 'Sync Live ESPN Rosters' in the sidebar first!")
+        # Check the memory safely using dictionary syntax
+        if st.session_state['rosters'] is None:
+            st.warning("Please click '🔄 Sync Live ESPN Rosters' in the sidebar first!")
             return
             
         with st.spinner("Scraping Pitcher List and isolating Free Agents..."):
@@ -88,9 +93,10 @@ def ui_pitcher_list_scanner():
                 pl_df['PL_Rank'] = pd.to_numeric(pl_df['PL_Rank'])
                 pl_df['Match_Name'] = pl_df['Player_Name'].str.lower().str.replace(r'[^a-z ]', '', regex=True)
                 
-                espn_df = st.session_state.rosters
+                # Safely pull the ESPN data
+                espn_df = st.session_state['rosters']
                 
-                # THE MAGIC LOGIC: Find Pitcher List players who are NOT on an ESPN roster
+                # Cross-reference
                 available_df = pl_df[~pl_df['Match_Name'].isin(espn_df['Match_Name'])]
                 
                 st.success(f"Found {len(available_df)} Top 100 Pitchers currently available in your league!")
@@ -105,7 +111,7 @@ def ui_pitcher_list_scanner():
 # --- APP EXECUTION ---
 fetch_espn_rosters()
 
-if 'rosters' in st.session_state:
+if st.session_state['rosters'] is not None:
     st.markdown("---")
     ui_pitcher_list_scanner()
 else:

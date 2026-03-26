@@ -26,7 +26,8 @@ def fetch_espn_rosters():
                 url = f"https://fantasy.espn.com/apis/v3/games/flb/seasons/2026/segments/0/leagues/{league_id}?view=mRoster"
                 cookies = {"espn_s2": espn_s2, "swid": swid}
                 
-                response = requests.get(url, cookies=cookies)
+                headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+                response = requests.get(url, cookies=cookies, headers=headers)
                 
                 if response.status_code == 200:
                     data = response.json()

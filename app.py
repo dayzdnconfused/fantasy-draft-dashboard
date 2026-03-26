@@ -22,7 +22,7 @@ def fetch_espn_rosters():
             try:
                 league_id = st.secrets["ESPN_LEAGUE_ID"]
                 
-                url = f"https://fantasy.espn.com/apis/v3/games/flb/seasons/2026/segments/0/leagues/{league_id}?view=mRoster"
+                url = f"https://lm-api-reads.fantasy.espn.com/apis/v3/games/flb/seasons/2024/segments/0/leagues/{league_id}?view=mRoster"
                 
                 # Upgraded Disguise + Requesting pure JSON
                 headers = {

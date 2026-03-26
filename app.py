@@ -12,6 +12,7 @@ if 'rosters' not in st.session_state:
     st.session_state['rosters'] = None
 
 # --- 2. ESPN API DIRECT INTEGRATION ---
+# --- 2. ESPN API DIRECT INTEGRATION ---
 def fetch_espn_rosters():
     st.sidebar.header("1. Sync League Rosters")
     st.sidebar.markdown("Pull live rosters directly from ESPN's hidden API.")
@@ -20,16 +21,22 @@ def fetch_espn_rosters():
         with st.spinner("Connecting to ESPN Servers..."):
             try:
                 league_id = st.secrets["ESPN_LEAGUE_ID"]
-                espn_s2 = st.secrets["ESPN_S2"]
-                swid = st.secrets["SWID"]
                 
                 url = f"https://fantasy.espn.com/apis/v3/games/flb/seasons/2026/segments/0/leagues/{league_id}?view=mRoster"
-                cookies = {"espn_s2": espn_s2, "swid": swid}
                 
-                headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-                response = requests.get(url, cookies=cookies, headers=headers)
+                # Upgraded Disguise + Requesting pure JSON
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                    'Accept': 'application/json'
+                }
                 
-                if response.status_code == 200:
+                # Since the league is PUBLIC, we completely drop the cookies!
+                response = requests.get(url, headers=headers)
+                
+                # Safety Check: Did ESPN try to redirect us to an HTML login page?
+                if 'application/json' not in response.headers.get('Content-Type', '').lower():
+                    st.sidebar.error("ESPN blocked the request and returned a webpage. Double-check that your League Manager made the league 'Viewable to Public'.")
+                elif response.status_code == 200:
                     data = response.json()
                     rostered_players = []
                     
@@ -49,11 +56,10 @@ def fetch_espn_rosters():
                     df = pd.DataFrame(rostered_players)
                     df['Match_Name'] = df['Player_Name'].str.lower().str.replace(r'[^a-z ]', '', regex=True)
                     
-                    # Safely save to dictionary state
                     st.session_state['rosters'] = df
                     st.sidebar.success(f"Successfully pulled {len(df)} rostered players directly from ESPN!")
                 else:
-                    st.sidebar.error(f"ESPN API Failed: Status {response.status_code}. Check your S2 and SWID cookies.")
+                    st.sidebar.error(f"ESPN API Failed: Status {response.status_code}.")
             except Exception as e:
                 st.sidebar.error(f"API Connection Error: {e}")
 

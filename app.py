@@ -115,6 +115,13 @@ def ui_pitcher_list_scanner():
             else:
                 st.error("Could not extract player rankings. Pitcher List may have changed their formatting.")
 
+# --- 5. DEVELOPER TOOLS (QC & DEBUGGING) ---
+if st.session_state['rosters'] is not None:
+    st.markdown("---")
+    with st.expander("🔍 Developer Tools: View Raw Databases"):
+        st.write("### ESPN Live Database")
+        st.dataframe(st.session_state['rosters'], use_container_width=True)
+
 # --- APP EXECUTION ---
 fetch_espn_rosters()
 
